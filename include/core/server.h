@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -13,7 +14,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day1 为止，它的职责是：
+// 到 Week2 Day2 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -24,6 +25,7 @@ namespace core {
 // 8. 对合法 GET/POST 生成静态 200 OK 响应
 // 9. 当一次 write() 写不完时，把剩余数据放进 outbuf，等待后续 EPOLLOUT 继续发送
 // 10. 使用 ReadyQueue 继续处理“用户态 buffer 里已经有完整请求，但本轮达到处理上限”的连接
+// 11. 对单连接单轮读/写量加预算，避免一个连接长时间独占 EventLoop
 class Server {
 public:
     // 构造函数：
@@ -48,6 +50,15 @@ public:
     [[nodiscard]] int listening_fd() const noexcept;
 
 private:
+    // EventBudget 表示“当前这一轮”允许一个连接继续消耗的读/写预算。
+    // Week2 Day2 的核心就是：
+    // - EPOLLIN / ReadyQueue 续读时，最多只读 256KB
+    // - EPOLLOUT / 响应写回时，最多只写 256KB
+    struct EventBudget {
+        std::size_t read_remaining = 0;
+        std::size_t write_remaining = 0;
+    };
+
     // ClientConnection 保存一个客户端连接在当前阶段所需的最小状态。
     struct ClientConnection {
         // 客户端 socket fd，由 RAII 负责自动关闭。
@@ -64,8 +75,13 @@ private:
         // 但为了支持一条连接里连续处理多个已缓冲请求，
         // 这里会等当前已经排队好的响应都写完之后再真正关闭连接。
         bool close_after_write = false;
-        // [Week2 Day1] New: 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
+        // [Week2 Day2] New: 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
         bool in_ready_queue = false;
+        // [Week2 Day2] New: 标记这个连接是否因为“读预算耗尽”而需要在 ReadyQueue 中继续读。
+        // 这个标记的存在，是为了区分两种 ReadyQueue 来源：
+        // 1. buffer 里还有完整请求，需要继续 parse/process
+        // 2. 还没读到完整请求，但这一轮的 read 预算已经用完，需要下一轮继续 read
+        bool ready_for_read = false;
     };
 
     // 把监听 socket 设置为非阻塞。
@@ -79,6 +95,12 @@ private:
     // 处理一轮 ReadyQueue。
     // ReadyQueue 用来承接“用户态 buffer 中已有完整请求，但本轮不再继续处理”的连接。
     void ProcessReadyQueue();
+    // 处理一个来自 ReadyQueue 的连接。
+    // 这个入口会按当前连接状态决定：
+    // - 是继续刷 outbuf
+    // - 还是继续处理已缓冲的完整请求
+    // - 还是继续执行上轮被预算打断的 read
+    void ContinueReadyConnection(int fd, EventBudget* budget);
     // 按事件来源分发处理逻辑。
     void HandlePollEvent(const net::PollEvent& event);
     // 处理监听 fd 上的可读事件。
@@ -97,22 +119,22 @@ private:
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
-    void ReadFromClient(int fd);
+    void ReadFromClient(int fd, EventBudget* budget);
     // 处理某个连接输入缓冲区里已经完整的请求头。
     // 返回值语义：
     // - true：当前轮还可以继续处理这个连接
     // - false：本轮应当停止处理，可能是连接已关闭，也可能是已达到单轮上限并入了 ReadyQueue
-    bool ProcessBufferedHeaders(int fd);
+    bool ProcessBufferedHeaders(int fd, EventBudget* budget);
     // 当还没找到 "\r\n\r\n" 时，检查请求头是否已经超过 8192 字节。
     bool CheckHeaderLimit(int fd);
     // 记录一条成功解析的请求摘要，方便 review 时观察解析结果。
     void LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const;
     // 对一个已经通过 Day5 校验的合法请求，启动当前阶段的静态 200 OK 响应流程。
-    void StartOkResponse(int fd, const http::HttpRequest& request);
+    void StartOkResponse(int fd, const http::HttpRequest& request, EventBudget* budget);
     // 继续把 outbuf 里还没发完的数据刷到 socket。
-    void FlushClientOutput(int fd);
-    // [Week2 Day1] New: 把一个连接加入 ReadyQueue，等待后续轮次继续处理。
-    void EnqueueReadyConnection(int fd);
+    void FlushClientOutput(int fd, EventBudget* budget);
+    // [Week2 Day2] New: 把一个连接加入 ReadyQueue，等待后续轮次继续处理。
+    void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
     // 尝试写出一个小的错误响应，然后关闭连接。
@@ -132,7 +154,7 @@ private:
     // epoll 封装对象。当前管理监听 fd 和客户端 fd。
     net::EpollPoller poller_;
 
-    // [Week2 Day1] New: ReadyQueue 保存“已经达到单轮处理上限，但 buffer 里还有完整请求”的连接 fd。
+    // [Week2 Day2] New: ReadyQueue 保存“本轮不能继续处理，但后续轮次还必须继续”的连接 fd。
     // 这些连接必须在后续轮次继续处理，不能依赖下一次 EPOLLIN。
     std::deque<int> ready_queue_;
     // 保存所有当前活跃的客户端连接。

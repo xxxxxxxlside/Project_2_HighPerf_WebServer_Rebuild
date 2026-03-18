@@ -32,11 +32,16 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day1 static response\n";
+constexpr std::string_view kStaticOkBody = "Week2 Day2 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
 constexpr std::size_t kMaxRequestsPerRound = 5;
+
+// Week2 Day2 新增单轮读/写预算。
+// 这两个预算都按“单连接、单轮处理”计算，而不是全局共享。
+constexpr std::size_t kMaxReadBytesPerEvent = 256 * 1024;
+constexpr std::size_t kMaxWriteBytesPerEvent = 256 * 1024;
 
 }  // namespace
 
@@ -45,7 +50,7 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week2 Day1 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week2 Day2 为止，这里仍然只做监听相关和事件循环相关的初始化。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
@@ -60,7 +65,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day1] listening on "
+        << "[Week2 Day2] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -101,7 +106,7 @@ void Server::RunEventLoopOnce() {
     }
 }
 
-// [Week2 Day1] Begin: ReadyQueue 用于续处理“本轮达到上限但 buffer 中还有完整请求”的连接。
+// [Week2 Day2] Begin: ReadyQueue 现在同时承接“请求处理上限”和“读预算耗尽”两种续处理场景。
 
 // 处理一轮 ReadyQueue。
 // 这里故意只处理“本轮开始时队列中已有的元素”，不把新入队的连接继续在同一轮吃完，
@@ -118,13 +123,51 @@ void Server::ProcessReadyQueue() {
         }
 
         it->second.in_ready_queue = false;
-        ProcessBufferedHeaders(fd);
+        EventBudget budget {kMaxReadBytesPerEvent, kMaxWriteBytesPerEvent};
+        ContinueReadyConnection(fd, &budget);
+    }
+}
+
+// 继续处理一个已经进入 ReadyQueue 的连接。
+// 顺序上有意做成：
+// 1. 先写：如果 outbuf 里还有响应尾部，优先刷完，避免响应顺序被打乱
+// 2. 再 parse：如果 input_buffer 里已经有完整请求，优先消费这些“已经在用户态可见”的工作
+// 3. 最后读：如果上轮是因为读预算耗尽才停下，就继续 read
+void Server::ContinueReadyConnection(int fd, EventBudget* budget) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) {
+        return;
+    }
+
+    if (!it->second.output_buffer.empty()) {
+        FlushClientOutput(fd, budget);
+    }
+
+    it = clients_.find(fd);
+    if (it == clients_.end() || !it->second.output_buffer.empty()) {
+        return;
+    }
+
+    if (it->second.input_buffer.HasCompleteHeader()) {
+        if (!ProcessBufferedHeaders(fd, budget)) {
+            return;
+        }
+    }
+
+    it = clients_.find(fd);
+    if (it == clients_.end() || !it->second.output_buffer.empty()) {
+        return;
+    }
+
+    if (it->second.ready_for_read) {
+        it->second.ready_for_read = false;
+        ReadFromClient(fd, budget);
     }
 }
 
 // 把一个连接加入 ReadyQueue。
 // 加入条件只有一个：当前连接 buffer 中明明还有完整请求，但本轮不允许继续处理了。
-void Server::EnqueueReadyConnection(int fd) {
+void Server::EnqueueReadyConnection(int fd, const char* reason) {
     auto it = clients_.find(fd);
     if (it == clients_.end()) {
         return;
@@ -138,13 +181,14 @@ void Server::EnqueueReadyConnection(int fd) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day1] queued client "
+        << "[Week2 Day2] queued client "
         << it->second.peer_endpoint
-        << " into ReadyQueue, buffered=" << it->second.input_buffer.size()
+        << " into ReadyQueue, reason=" << reason
+        << ", buffered=" << it->second.input_buffer.size()
         << '\n';
 }
 
-// [Week2 Day1] End
+// [Week2 Day2] End
 
 // 统一分发一轮事件。
 void Server::HandlePollEvent(const net::PollEvent& event) {
@@ -167,7 +211,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day1] drained "
+            << "[Week2 Day2] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -175,7 +219,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
 }
 
 // 处理客户端 fd 的事件。
-// 到 Day6 为止，连接可能同时出现：
+// 到 Week2 Day2 为止，连接可能同时出现：
 // 1. 读事件：继续接收请求头
 // 2. 写事件：把 outbuf 里未发完的响应继续写出去
 // 3. 关闭/错误事件：直接回收连接
@@ -190,12 +234,13 @@ void Server::HandleClientEvent(int fd, std::uint32_t events) {
         return;
     }
 
-    // 如果当前连接已经进入“响应待写完”状态，
-    // 就优先处理 EPOLLOUT。
+    EventBudget budget {kMaxReadBytesPerEvent, kMaxWriteBytesPerEvent};
+
+    // 如果当前连接已经进入“响应待写完”状态，就优先处理 EPOLLOUT。
     // 只有当待发送数据已经清空后，才继续考虑本轮的 EPOLLIN。
     if (!it->second.output_buffer.empty()) {
         if ((events & EPOLLOUT) != 0U) {
-            FlushClientOutput(fd);
+            FlushClientOutput(fd, &budget);
         }
 
         it = clients_.find(fd);
@@ -205,7 +250,7 @@ void Server::HandleClientEvent(int fd, std::uint32_t events) {
     }
 
     if ((events & EPOLLIN) != 0U) {
-        ReadFromClient(fd);
+        ReadFromClient(fd, &budget);
     }
 }
 
@@ -241,34 +286,42 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     clients_.emplace(client_fd, std::move(connection));
 
     std::cout
-        << "[Week2 Day1] registered client "
+        << "[Week2 Day2] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
         << '\n';
 }
 
 // 从客户端循环读数据到应用层缓冲区。
-// 只要还有数据可读，就持续 read；直到遇到 EAGAIN 才结束这一轮。
-void Server::ReadFromClient(int fd) {
+// 只要还有预算且还有数据可读，就持续 read；
+// 遇到 EAGAIN 结束本轮，遇到预算耗尽则把连接加入 ReadyQueue 在后续轮次继续读。
+void Server::ReadFromClient(int fd, EventBudget* budget) {
+    if (budget == nullptr) {
+        throw std::invalid_argument("budget must not be null");
+    }
+
     char buffer[kReadChunkSize];
 
-    while (true) {
+    while (budget->read_remaining > 0) {
         auto it = clients_.find(fd);
         if (it == clients_.end()) {
             return;
         }
 
         ClientConnection& connection = it->second;
-        const ssize_t bytes_read = ::read(fd, buffer, sizeof(buffer));
+        const std::size_t read_attempt = std::min<std::size_t>(sizeof(buffer), budget->read_remaining);
+        const ssize_t bytes_read = ::read(fd, buffer, read_attempt);
         if (bytes_read > 0) {
+            budget->read_remaining -= static_cast<std::size_t>(bytes_read);
             connection.input_buffer.Append(buffer, static_cast<std::size_t>(bytes_read));
 
             std::cout
-                << "[Week2 Day1] read "
+                << "[Week2 Day2] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
                 << ", buffered=" << connection.input_buffer.size()
+                << ", read_budget_remaining=" << budget->read_remaining
                 << '\n';
 
             // 这条检查必须尽早做，因为文档要求的是：
@@ -277,7 +330,18 @@ void Server::ReadFromClient(int fd) {
                 return;
             }
 
-            if (!ProcessBufferedHeaders(fd)) {
+            if (!ProcessBufferedHeaders(fd, budget)) {
+                return;
+            }
+
+            it = clients_.find(fd);
+            if (it == clients_.end()) {
+                return;
+            }
+
+            if (budget->read_remaining == 0) {
+                it->second.ready_for_read = true;
+                EnqueueReadyConnection(fd, "read budget exhausted");
                 return;
             }
 
@@ -300,6 +364,14 @@ void Server::ReadFromClient(int fd) {
         CloseClientConnection(fd, "read() failed");
         return;
     }
+
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) {
+        return;
+    }
+
+    it->second.ready_for_read = true;
+    EnqueueReadyConnection(fd, "read budget exhausted");
 }
 
 // 检查请求头是否已经超过 Day5 规定的 8192 字节上限。
@@ -321,12 +393,16 @@ bool Server::CheckHeaderLimit(int fd) {
     return false;
 }
 
-// [Week2 Day1] Begin: 单连接单轮最多处理 5 个完整请求；超限但 buffer 仍有完整请求时，必须进入 ReadyQueue。
+// [Week2 Day2] Begin: 在保留“5 个完整请求上限”的同时，引入单轮读预算控制。
 
 // 只要输入缓冲区里已经有完整 header，就循环拿出来解析。
 // 和 Day6 最大的不同点是：这里不再“有多少处理多少”，而是给每轮增加上限。
 // 一旦达到上限但 buffer 里还有完整请求，就把连接丢进 ReadyQueue，留到后续轮次继续处理。
-bool Server::ProcessBufferedHeaders(int fd) {
+bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
+    if (budget == nullptr) {
+        throw std::invalid_argument("budget must not be null");
+    }
+
     std::size_t processed_requests = 0;
 
     while (processed_requests < kMaxRequestsPerRound) {
@@ -371,7 +447,7 @@ bool Server::ProcessBufferedHeaders(int fd) {
         LogParsedRequest(connection, request);
 
         // 当前阶段仍然只基于 header 做最小决策，不进入后续的 body 状态机。
-        StartOkResponse(fd, request);
+        StartOkResponse(fd, request, budget);
         ++processed_requests;
     }
 
@@ -382,11 +458,13 @@ bool Server::ProcessBufferedHeaders(int fd) {
 
     ClientConnection& connection = it->second;
     if (connection.input_buffer.HasCompleteHeader()) {
-        EnqueueReadyConnection(fd);
+        EnqueueReadyConnection(fd, "request processing cap reached");
         return false;
     }
 
-    if (connection.output_buffer.empty() && connection.close_after_write) {
+    if (connection.output_buffer.empty() &&
+        connection.close_after_write &&
+        !connection.ready_for_read) {
         CloseClientConnection(fd, "all buffered requests handled and responses sent");
         return false;
     }
@@ -394,7 +472,7 @@ bool Server::ProcessBufferedHeaders(int fd) {
     return true;
 }
 
-// [Week2 Day1] End
+// [Week2 Day2] End
 
 // 把一条成功解析的请求摘要打印出来。
 // 这样 review 时可以直接看到：
@@ -404,7 +482,7 @@ bool Server::ProcessBufferedHeaders(int fd) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day1] parsed request from "
+        << "[Week2 Day2] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -420,14 +498,18 @@ void Server::LogParsedRequest(const ClientConnection& connection, const http::Ht
     std::cout << '\n';
 }
 
-// [Week2 Day1] Begin: 响应写回链路要兼容“同一连接内连续处理多个已缓冲请求”。
+// [Week2 Day2] Begin: 响应写回链路增加单轮写预算，避免大 outbuf 长时间独占 EventLoop。
 
 // 对已经通过 Day5 解析与校验的请求，启动最小 200 OK 响应流程。
 // 处理顺序是：
 // 1. 先立刻尝试写一次，尽量减少额外的 epoll 往返
 // 2. 如果没写完，就把剩余部分放进 outbuf
 // 3. 把连接改成监听 EPOLLOUT，等下一次可写时继续发送
-void Server::StartOkResponse(int fd, const http::HttpRequest& request) {
+void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudget* budget) {
+    if (budget == nullptr) {
+        throw std::invalid_argument("budget must not be null");
+    }
+
     auto it = clients_.find(fd);
     if (it == clients_.end()) {
         return;
@@ -445,17 +527,33 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request) {
         return;
     }
 
+    // 如果这轮写预算已经用完，就不要再尝试 write() 了。
+    // 直接把响应放进 outbuf，等后续 EPOLLOUT 再继续发送。
+    if (budget->write_remaining == 0) {
+        connection.output_buffer = response;
+        UpdateClientPollMask(fd);
+        std::cout
+            << "[Week2 Day2] deferred 200 OK for "
+            << connection.peer_endpoint
+            << " because write budget is exhausted"
+            << '\n';
+        return;
+    }
+
     std::size_t written = 0;
     try {
-        written = net::WriteSomeNonBlocking(fd, response);
+        const std::size_t write_attempt = std::min<std::size_t>(response.size(), budget->write_remaining);
+        written = net::WriteSomeNonBlocking(fd, std::string_view(response.data(), write_attempt));
     } catch (const std::system_error&) {
         CloseClientConnection(fd, "write() failed while sending 200 OK");
         return;
     }
 
+    budget->write_remaining -= written;
+
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day1] sent full 200 OK to "
+            << "[Week2 Day2] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
             << '\n';
@@ -466,17 +564,22 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request) {
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day1] queued "
+        << "[Week2 Day2] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
+        << ", write_budget_remaining=" << budget->write_remaining
         << '\n';
 }
 
 // 继续把输出缓冲区中的剩余字节刷到 socket。
 // 只要内核还能继续接收数据，就尽量多写；一旦遇到 EAGAIN 就停下，
 // 保留剩余字节，等待下一次 EPOLLOUT。
-void Server::FlushClientOutput(int fd) {
+void Server::FlushClientOutput(int fd, EventBudget* budget) {
+    if (budget == nullptr) {
+        throw std::invalid_argument("budget must not be null");
+    }
+
     while (true) {
         auto it = clients_.find(fd);
         if (it == clients_.end()) {
@@ -487,7 +590,13 @@ void Server::FlushClientOutput(int fd) {
         if (connection.output_buffer.empty()) {
             if (connection.input_buffer.HasCompleteHeader()) {
                 UpdateClientPollMask(fd);
-                EnqueueReadyConnection(fd);
+                EnqueueReadyConnection(fd, "buffer already has complete requests after flush");
+                return;
+            }
+
+            if (connection.ready_for_read) {
+                UpdateClientPollMask(fd);
+                EnqueueReadyConnection(fd, "continue read after flush");
                 return;
             }
 
@@ -500,9 +609,23 @@ void Server::FlushClientOutput(int fd) {
             return;
         }
 
+        if (budget->write_remaining == 0) {
+            std::cout
+                << "[Week2 Day2] paused writing to "
+                << connection.peer_endpoint
+                << " because write budget is exhausted"
+                << '\n';
+            UpdateClientPollMask(fd);
+            return;
+        }
+
         std::size_t written = 0;
         try {
-            written = net::WriteSomeNonBlocking(fd, connection.output_buffer);
+            const std::size_t write_attempt =
+                std::min<std::size_t>(connection.output_buffer.size(), budget->write_remaining);
+            written = net::WriteSomeNonBlocking(
+                fd,
+                std::string_view(connection.output_buffer.data(), write_attempt));
         } catch (const std::system_error&) {
             CloseClientConnection(fd, "write() failed while flushing outbuf");
             return;
@@ -512,13 +635,15 @@ void Server::FlushClientOutput(int fd) {
             return;
         }
 
+        budget->write_remaining -= written;
         connection.output_buffer.erase(0, written);
         std::cout
-            << "[Week2 Day1] flushed "
+            << "[Week2 Day2] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
             << ", remaining=" << connection.output_buffer.size()
+            << ", write_budget_remaining=" << budget->write_remaining
             << '\n';
     }
 }
@@ -538,9 +663,9 @@ void Server::UpdateClientPollMask(int fd) {
     poller_.Modify(fd, events);
 }
 
-// [Week2 Day1] End
+// [Week2 Day2] End
 
-// [Week2 Day1] Begin: 统一收口当前阶段的错误响应与关闭流程。
+// [Week2 Day2] Begin: 统一收口当前阶段的错误响应与关闭流程。
 
 // 发送一个很小的错误响应，然后立即关闭连接。
 // 这里采用 best-effort：
@@ -561,7 +686,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day1] sent error response "
+        << "[Week2 Day2] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -571,7 +696,7 @@ void Server::SendErrorResponseAndClose(int fd,
     CloseClientConnection(fd, close_reason);
 }
 
-// [Week2 Day1] End
+// [Week2 Day2] End
 
 // 关闭并移除一个客户端连接。
 // 当前阶段还没有 Week2 后续要做的 pending_close_queue，所以这里直接收掉即可。
@@ -583,10 +708,11 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     }
 
     it->second.in_ready_queue = false;
+    it->second.ready_for_read = false;
     ready_queue_.erase(std::remove(ready_queue_.begin(), ready_queue_.end(), fd), ready_queue_.end());
 
     std::cout
-        << "[Week2 Day1] closing client "
+        << "[Week2 Day2] closing client "
         << it->second.peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
