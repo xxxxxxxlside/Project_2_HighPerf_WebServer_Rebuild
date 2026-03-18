@@ -1,4 +1,4 @@
-#include "core/server.h"
+﻿#include "core/server.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -32,7 +32,7 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day5 static response\n";
+constexpr std::string_view kStaticOkBody = "Week2 Day6 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -54,6 +54,10 @@ constexpr double kIpBucketBurst = 200.0;
 constexpr double kIpBucketRefillPerSecond = 50.0;
 constexpr std::size_t kIpBucketMaxEntries = 100000;
 constexpr auto kIpBucketTtl = std::chrono::minutes(10);
+
+// Week2 Day6 新增全局活跃连接数封顶。
+// 这里写死默认值 200k，和文档保持一致；后续如果项目再引入配置系统，再把它接成可配置项。
+constexpr std::size_t kMaxConnections = 200000;
 
 // 当前工程到这里仍然只支持 IPv4，对端地址字符串始终是 "ip:port"。
 // 因此这里直接按最后一个 ':' 把 IP 部分切出来即可。
@@ -87,7 +91,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day5] listening on "
+        << "[Week2 Day6] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -144,7 +148,7 @@ void Server::FlushPendingCloseQueue() {
     }
 
     std::cout
-        << "[Week2 Day5] releasing "
+        << "[Week2 Day6] releasing "
         << pending_close_queue_.size()
         << " connection object(s) from pending_close_queue"
         << '\n';
@@ -225,7 +229,7 @@ void Server::EnqueueReadyConnection(int fd, const char* reason) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day5] queued client "
+        << "[Week2 Day6] queued client "
         << it->second.peer_endpoint
         << " into ReadyQueue, reason=" << reason
         << ", buffered=" << it->second.input_buffer.size()
@@ -262,7 +266,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day5] drained "
+            << "[Week2 Day6] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -330,13 +334,13 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
         throw std::logic_error("accepted socket must be valid");
     }
 
-    // [Week2 Day5] Begin: accept 成功不等于一定放行。
-    // 当前阶段新增的限流点就在这里：先检查这个来源 IP 是否还有 token，
-    // 只有放行后，连接才会真正进入 epoll 和 clients_。
+    // accept 成功不等于一定放行。
+    // 当前 accept 路径上有两层守门：
+    // 1. 先做 IP token bucket，避免单个来源在短时间内冲进太多连接
+    // 2. 再做全局连接数封顶，避免总连接数继续上涨
     if (!CheckIpRateLimitBeforeRegister(accepted)) {
         return;
     }
-    // [Week2 Day5] End
 
     ClientConnection connection;
     connection.socket = std::move(accepted.fd);
@@ -344,15 +348,59 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
 
     poller_.Add(client_fd, EPOLLIN | EPOLLRDHUP);
     clients_.emplace(client_fd, std::move(connection));
+    ++active_connection_count_;
 
     std::cout
-        << "[Week2 Day5] registered client "
+        << "[Week2 Day6] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
+        << ", active_connections=" << active_connection_count_
         << '\n';
+
+    // [Week2 Day6] Begin:
+    // 连接已经纳入 epoll 和 clients_ 之后，立刻检查全局连接数上限。
+    // 这里故意放在“注册之后”而不是“注册之前”，是为了严格遵守文档里的计数口径：
+    // 1. accept 成功并纳入管理后，活跃连接数先 +1
+    // 2. 如果发现超限，再通过唯一关闭入口把 closing=true，并在那个入口里 -1
+    //
+    // 这样无论是正常关闭还是“刚 accept 就被拒绝”，都走同一套生命周期路径，
+    // 后面做 review 时更容易检查连接数和拒绝计数是不是对得上。
+    if (!EnforceConnectionLimitAfterRegister(client_fd)) {
+        return;
+    }
+    // [Week2 Day6] End
 }
 
-// [Week2 Day5] Begin: accept 路径上的 IP token bucket。
+// [Week2 Day6] New:
+// 这个函数专门收口“accept 成功后发现总连接数超限”的分支。
+// 它不直接手写 close 逻辑，而是继续复用唯一关闭入口，原因有两个：
+// 1. 连接计数的递减口径已经写进关闭入口，避免一处忘减导致统计失真
+// 2. 关闭顺序、ReadyQueue 摘除、pending_close_queue 延迟释放也都已经在那条路径里统一好了
+bool Server::EnforceConnectionLimitAfterRegister(int fd) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end() || it->second.closing) {
+        return false;
+    }
+
+    if (active_connection_count_ <= kMaxConnections) {
+        return true;
+    }
+
+    ++conn_reject_total_;
+    std::cout
+        << "[Week2 Day6] rejecting client "
+        << it->second.peer_endpoint
+        << " because active connection limit was exceeded"
+        << ", active_connections=" << active_connection_count_
+        << ", max_connections=" << kMaxConnections
+        << ", conn_reject_total=" << conn_reject_total_
+        << '\n';
+
+    CloseClientConnection(fd, "active connection limit exceeded after accept");
+    return false;
+}
+
+// accept 路径上的 IP token bucket。
 
 // 在 accept 成功后、真正注册连接前检查该 IP 是否还有 token。
 // 设计上把这个检查放在“accept 之后、epoll 注册之前”，原因是：
@@ -395,7 +443,7 @@ bool Server::CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted)
 
         const bool write_ok = net::WriteBestEffort(accepted.fd.get(), response);
         std::cout
-            << "[Week2 Day5] rejected accepted socket from "
+            << "[Week2 Day6] rejected accepted socket from "
             << accepted.peer_endpoint
             << ", reason=ip token bucket exhausted"
             << ", write_complete=" << (write_ok ? "true" : "false")
@@ -470,8 +518,6 @@ void Server::EvictOldestIpBucket() {
     ip_bucket_lru_.pop_front();
     ip_token_buckets_.erase(oldest_ip);
 }
-
-// [Week2 Day5] End
 
 // inflight budget 统一在 Server 内部串行维护。
 
@@ -604,7 +650,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
             }
 
             std::cout
-                << "[Week2 Day5] read "
+                << "[Week2 Day6] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
@@ -779,7 +825,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day5] parsed request from "
+        << "[Week2 Day6] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -832,7 +878,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
         }
         UpdateClientPollMask(fd);
         std::cout
-            << "[Week2 Day5] deferred 200 OK for "
+            << "[Week2 Day6] deferred 200 OK for "
             << connection.peer_endpoint
             << " because write budget is exhausted"
             << '\n';
@@ -852,7 +898,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
 
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day5] sent full 200 OK to "
+            << "[Week2 Day6] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
             << '\n';
@@ -867,7 +913,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day5] queued "
+        << "[Week2 Day6] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
@@ -915,7 +961,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
         if (budget->write_remaining == 0) {
             std::cout
-                << "[Week2 Day5] paused writing to "
+                << "[Week2 Day6] paused writing to "
                 << connection.peer_endpoint
                 << " because write budget is exhausted"
                 << '\n';
@@ -943,7 +989,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
         connection.output_buffer.erase(0, written);
         ReleaseInflightBytes(written);
         std::cout
-            << "[Week2 Day5] flushed "
+            << "[Week2 Day6] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
@@ -987,7 +1033,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day5] sent error response "
+        << "[Week2 Day6] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -1016,7 +1062,17 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         return;
     }
 
+    // [Week2 Day6] New:
+    // active_connection_count_ 的递减放在“首次进入关闭流程”的这一刻。
+    // 这样做的原因是：
+    // 1. 文档要求 closing=true 成为活跃连接计数递减的唯一时机
+    // 2. 后续即使对象还在 pending_close_queue 里等统一释放，它也已经不再算活跃连接
+    // 3. 因为 closing=true 只能在这个函数里置位，所以不会重复 -1
     it->second.closing = true;
+    if (active_connection_count_ > 0) {
+        --active_connection_count_;
+    }
+
     it->second.in_ready_queue = false;
     it->second.ready_for_read = false;
     ready_queue_.erase(std::remove(ready_queue_.begin(), ready_queue_.end(), fd), ready_queue_.end());
@@ -1024,10 +1080,12 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     const std::string peer_endpoint = it->second.peer_endpoint;
 
     std::cout
-        << "[Week2 Day5] closing client "
+        << "[Week2 Day6] closing client "
         << peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
+        << ", active_connections=" << active_connection_count_
+        << ", conn_reject_total=" << conn_reject_total_
         << '\n';
 
     if (it->second.socket.valid()) {

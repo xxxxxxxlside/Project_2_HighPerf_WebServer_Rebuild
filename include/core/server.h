@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +17,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day5 为止，它的职责是：
+// 到 Week2 Day6 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -32,6 +32,7 @@ namespace core {
 // 12. 使用唯一关闭入口和 pending_close_queue，避免关闭过程中的 UAF 风险
 // 13. 对 inbuf/outbuf 维护全局 inflight budget，并对过大 Content-Length 返回 413
 // 14. 在 accept 路径上增加按 IP 计数的 token bucket，限制瞬时接入速率
+// 15. 对全局活跃连接数做 max_conns 封顶，超限连接仍然走统一关闭流程
 class Server {
 public:
     // 构造函数：
@@ -148,6 +149,16 @@ private:
     std::size_t DrainAcceptQueue();
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
+    // [Week2 Day6] New:
+    // accept 成功并注册后，立刻检查当前活跃连接数是否已经超过上限。
+    // 这里单独拆成函数，是为了把“连接数封顶”的逻辑和“普通注册流程”分开：
+    // 1. RegisterAcceptedConnection() 只负责把连接纳入管理
+    // 2. 这个函数专门负责 Day6 的超限判定和拒绝语义
+    //
+    // 返回值语义：
+    // - true ：连接数量仍在允许范围内，这个连接可以继续正常服务
+    // - false：连接已经因为超限被拒绝，并且走完了统一关闭流程
+    bool EnforceConnectionLimitAfterRegister(int fd);
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd, EventBudget* budget);
     // 处理某个连接输入缓冲区里已经完整的请求头。
@@ -178,7 +189,7 @@ private:
     bool AppendToOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
     // 带 inflight budget 检查地替换整个输出缓冲区。
     bool ReplaceOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
-    // [Week2 Day5] New: 在 accept 成功后、正式注册进 epoll 前，检查该 IP 是否还有可用 token。
+    // 在 accept 成功后、正式注册进 epoll 前，检查该 IP 是否还有可用 token。
     // 返回 false 表示当前连接已经被 429 + close 拒绝，不应再继续注册。
     bool CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted);
     // 按 elapsed time 给一个 IP bucket 补充 token。
@@ -222,9 +233,21 @@ private:
     std::vector<PendingCloseEntry> pending_close_queue_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
+    // [Week2 Day6] New:
+    // active_connection_count_ 只统计“已经纳入 epoll 管理，且 closing=false”的连接数。
+    // 它的口径和文档里的 max_conns 完全一致：
+    // 1. accept 成功并完成注册时 +1
+    // 2. 首次进入唯一关闭流程、置 closing=true 时 -1
+    //
+    // 之所以不用 clients_.size() 临时现算，是为了把“什么时候加、什么时候减”的语义写死，
+    // 后面做 review 或加 metrics 时更容易检查这条计数是不是守恒。
+    std::size_t active_connection_count_ = 0;
+    // conn_reject_total_ 统计“因为超过 max_conns 而被拒绝”的连接总数。
+    // 当前阶段它主要用于日志和 review，Week3 再继续接到统一 metrics。
+    std::size_t conn_reject_total_ = 0;
     // 统计当前所有活跃连接 inbuf + outbuf 占用的总字节数。
     std::size_t global_inflight_bytes_ = 0;
-    // [Week2 Day5] New: ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
+    // ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
     std::list<std::string> ip_bucket_lru_;
     std::unordered_map<std::string, IpTokenBucketEntry> ip_token_buckets_;
 
