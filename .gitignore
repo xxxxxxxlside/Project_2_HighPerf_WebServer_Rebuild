@@ -1,0 +1,17 @@
+build/
+
+*.o
+*.a
+*.so
+*.log
+
+results/*/metrics.log
+
+.vscode/
+.idea/
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
