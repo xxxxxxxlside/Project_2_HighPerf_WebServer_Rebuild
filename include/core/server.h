@@ -15,7 +15,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day3 为止，它的职责是：
+// 到 Week2 Day4 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -28,6 +28,7 @@ namespace core {
 // 10. 使用 ReadyQueue 继续处理“用户态 buffer 里已经有完整请求，但本轮达到处理上限”的连接
 // 11. 对单连接单轮读/写量加预算，避免一个连接长时间独占 EventLoop
 // 12. 使用唯一关闭入口和 pending_close_queue，避免关闭过程中的 UAF 风险
+// 13. 对 inbuf/outbuf 维护全局 inflight budget，并对过大 Content-Length 返回 413
 class Server {
 public:
     // 构造函数：
@@ -84,7 +85,7 @@ private:
         // 1. buffer 里还有完整请求，需要继续 parse/process
         // 2. 还没读到完整请求，但这一轮的 read 预算已经用完，需要下一轮继续 read
         bool ready_for_read = false;
-        // [Week2 Day3] New: closing=true 表示该连接已经进入唯一关闭流程。
+        // closing=true 表示该连接已经进入唯一关闭流程。
         // 一旦置位，后续任何读写/回调都应该跳过，避免对“正在销毁”的连接继续操作。
         bool closing = false;
     };
@@ -120,7 +121,7 @@ private:
     // 对监听 socket 来说，“可读”意味着有新连接可以 accept。
     void HandleListenEvent(std::uint32_t events);
     // 处理客户端连接上的事件。
-    // 到 Week2 Day3 为止，这里主要区分三类情况：
+    // 到 Week2 Day4 为止，这里主要区分三类情况：
     // 1. 对端关闭 / 错误
     // 2. 可读事件：继续收 header 并解析
     // 3. 可写事件：继续把 outbuf 中没写完的响应刷出去
@@ -150,12 +151,23 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
+    // [Week2 Day4] New: 在向 inbuf/outbuf 追加数据前先做全局 inflight budget 检查。
+    // 这一步只负责判定“能不能继续追加”，真正的计数递增只会发生在追加成功之后。
+    bool TryReserveInflightBytes(int fd, std::size_t add_bytes, const char* reason);
+    // 按“已释放的 buffer 字节数”回收全局 inflight budget。
+    void ReleaseInflightBytes(std::size_t release_bytes) noexcept;
+    // 带 inflight budget 检查地向输入缓冲区追加数据。
+    bool AppendToInputBuffer(int fd, ClientConnection* connection, const char* data, std::size_t size);
+    // 带 inflight budget 检查地向输出缓冲区尾部追加数据。
+    bool AppendToOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
+    // 带 inflight budget 检查地替换整个输出缓冲区。
+    bool ReplaceOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
     // 尝试写出一个小的错误响应，然后关闭连接。
     void SendErrorResponseAndClose(int fd,
                                    int status_code,
                                    const char* reason_phrase,
                                    const char* close_reason);
-    // [Week2 Day3] New: 连接关闭的唯一入口。
+    // 连接关闭的唯一入口。
     // 调用它时会统一完成：
     // 1. 置 closing=true
     // 2. 从 ReadyQueue 摘除
@@ -177,10 +189,12 @@ private:
     // ReadyQueue 保存“本轮不能继续处理，但后续轮次还必须继续”的连接 fd。
     // 这些连接必须在后续轮次继续处理，不能依赖下一次 EPOLLIN。
     std::deque<int> ready_queue_;
-    // [Week2 Day3] New: pending_close_queue 保存“本轮已关闭但尚未真正释放”的连接对象。
+    // pending_close_queue 保存“本轮已关闭但尚未真正释放”的连接对象。
     std::vector<PendingCloseEntry> pending_close_queue_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
+    // [Week2 Day4] New: 统计当前所有活跃连接 inbuf + outbuf 占用的总字节数。
+    std::size_t global_inflight_bytes_ = 0;
 
     // Day5 引入的最小 HTTP 头解析器。
     http::HttpParser http_parser_;

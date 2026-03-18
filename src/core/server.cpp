@@ -32,7 +32,7 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day3 static response\n";
+constexpr std::string_view kStaticOkBody = "Week2 Day4 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -43,6 +43,12 @@ constexpr std::size_t kMaxRequestsPerRound = 5;
 constexpr std::size_t kMaxReadBytesPerEvent = 256 * 1024;
 constexpr std::size_t kMaxWriteBytesPerEvent = 256 * 1024;
 
+// Week2 Day4 引入两个新的硬限制：
+// 1. Content-Length 不能超过 8MB
+// 2. 所有活跃连接 inbuf + outbuf 的总和不能超过 512MB
+constexpr std::size_t kMaxBodyBytes = 8 * 1024 * 1024;
+constexpr std::size_t kMaxInflightBytes = 512ULL * 1024 * 1024;
+
 }  // namespace
 
 // 构造函数只保存配置，不做系统调用。
@@ -50,7 +56,7 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week2 Day3 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week2 Day4 为止，这里仍然只做监听相关和事件循环相关的初始化。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
@@ -65,7 +71,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day3] listening on "
+        << "[Week2 Day4] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -108,8 +114,6 @@ void Server::RunEventLoopOnce() {
     FlushPendingCloseQueue();
 }
 
-// [Week2 Day3] Begin: pending_close_queue 负责把“关闭”和“释放”拆到同一轮的两个时点。
-
 // 在本轮 EventLoop 末尾统一释放 pending_close_queue 中保存的连接对象。
 // 这些对象在进入队列前，已经完成：
 // 1. closing=true
@@ -124,17 +128,13 @@ void Server::FlushPendingCloseQueue() {
     }
 
     std::cout
-        << "[Week2 Day3] releasing "
+        << "[Week2 Day4] releasing "
         << pending_close_queue_.size()
         << " connection object(s) from pending_close_queue"
         << '\n';
 
     pending_close_queue_.clear();
 }
-
-// [Week2 Day3] End
-
-// [Week2 Day3] Begin: ReadyQueue 续处理逻辑要与 closing 状态配合，避免继续操作待销毁连接。
 
 // 处理一轮 ReadyQueue。
 // 这里故意只处理“本轮开始时队列中已有的元素”，不把新入队的连接继续在同一轮吃完，
@@ -209,14 +209,12 @@ void Server::EnqueueReadyConnection(int fd, const char* reason) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day3] queued client "
+        << "[Week2 Day4] queued client "
         << it->second.peer_endpoint
         << " into ReadyQueue, reason=" << reason
         << ", buffered=" << it->second.input_buffer.size()
         << '\n';
 }
-
-// [Week2 Day3] End
 
 // 统一分发一轮事件。
 void Server::HandlePollEvent(const net::PollEvent& event) {
@@ -248,7 +246,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day3] drained "
+            << "[Week2 Day4] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -256,7 +254,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
 }
 
 // 处理客户端 fd 的事件。
-// 到 Week2 Day3 为止，连接可能同时出现：
+// 到 Week2 Day4 为止，连接可能同时出现：
 // 1. 读事件：继续接收请求头
 // 2. 写事件：把 outbuf 里未发完的响应继续写出去
 // 3. 关闭/错误事件：直接回收连接
@@ -323,11 +321,115 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     clients_.emplace(client_fd, std::move(connection));
 
     std::cout
-        << "[Week2 Day3] registered client "
+        << "[Week2 Day4] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
         << '\n';
 }
+
+// [Week2 Day4] Begin: inflight budget 统一在 Server 内部串行维护。
+
+// 在向 inbuf/outbuf 追加数据前，先检查全局 inflight budget 是否还有空间。
+// 这里故意只做“判定”，不直接递增计数；
+// 因为文档要求只有在 append/assign 真正成功之后，global_inflight_bytes 才能增加。
+bool Server::TryReserveInflightBytes(int fd, std::size_t add_bytes, const char* reason) {
+    if (add_bytes == 0) {
+        return true;
+    }
+
+    const bool over_limit =
+        global_inflight_bytes_ > kMaxInflightBytes ||
+        add_bytes > (kMaxInflightBytes - global_inflight_bytes_);
+
+    if (!over_limit) {
+        return true;
+    }
+
+    SendErrorResponseAndClose(fd,
+                              503,
+                              "Service Unavailable",
+                              reason);
+    return false;
+}
+
+// 当 inbuf/outbuf 消费、缩小或丢弃数据时，要把对应字节数同步从全局计数里扣掉。
+// 这里做了保护性夹断，避免调试阶段因为重复释放导致 size_t 下溢。
+void Server::ReleaseInflightBytes(std::size_t release_bytes) noexcept {
+    if (release_bytes >= global_inflight_bytes_) {
+        global_inflight_bytes_ = 0;
+        return;
+    }
+
+    global_inflight_bytes_ -= release_bytes;
+}
+
+// 带预算检查地向输入缓冲区追加数据。
+// 只有 append 成功之后，global_inflight_bytes 才会真的增加。
+bool Server::AppendToInputBuffer(int fd,
+                                 ClientConnection* connection,
+                                 const char* data,
+                                 std::size_t size) {
+    if (connection == nullptr) {
+        throw std::invalid_argument("connection must not be null");
+    }
+    if (size == 0) {
+        return true;
+    }
+
+    if (!TryReserveInflightBytes(fd, size, "global inflight budget exceeded while growing input buffer")) {
+        return false;
+    }
+
+    connection->input_buffer.Append(data, size);
+    global_inflight_bytes_ += size;
+    return true;
+}
+
+// 带预算检查地向输出缓冲区尾部追加数据。
+bool Server::AppendToOutputBuffer(int fd, ClientConnection* connection, std::string_view data) {
+    if (connection == nullptr) {
+        throw std::invalid_argument("connection must not be null");
+    }
+    if (data.empty()) {
+        return true;
+    }
+
+    if (!TryReserveInflightBytes(fd, data.size(), "global inflight budget exceeded while growing output buffer")) {
+        return false;
+    }
+
+    connection->output_buffer.append(data);
+    global_inflight_bytes_ += data.size();
+    return true;
+}
+
+// 用一段新的内容替换整个输出缓冲区。
+// 这个函数专门处理“同一个 outbuf 可能变大，也可能变小”的情况。
+bool Server::ReplaceOutputBuffer(int fd, ClientConnection* connection, std::string_view data) {
+    if (connection == nullptr) {
+        throw std::invalid_argument("connection must not be null");
+    }
+
+    const std::size_t old_size = connection->output_buffer.size();
+    const std::size_t new_size = data.size();
+
+    if (new_size > old_size) {
+        const std::size_t growth = new_size - old_size;
+        if (!TryReserveInflightBytes(fd, growth, "global inflight budget exceeded while replacing output buffer")) {
+            return false;
+        }
+
+        connection->output_buffer.assign(data.data(), data.size());
+        global_inflight_bytes_ += growth;
+        return true;
+    }
+
+    connection->output_buffer.assign(data.data(), data.size());
+    ReleaseInflightBytes(old_size - new_size);
+    return true;
+}
+
+// [Week2 Day4] End
 
 // 从客户端循环读数据到应用层缓冲区。
 // 只要还有预算且还有数据可读，就持续 read；
@@ -350,15 +452,21 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
         const ssize_t bytes_read = ::read(fd, buffer, read_attempt);
         if (bytes_read > 0) {
             budget->read_remaining -= static_cast<std::size_t>(bytes_read);
-            connection.input_buffer.Append(buffer, static_cast<std::size_t>(bytes_read));
+            if (!AppendToInputBuffer(fd,
+                                     &connection,
+                                     buffer,
+                                     static_cast<std::size_t>(bytes_read))) {
+                return;
+            }
 
             std::cout
-                << "[Week2 Day3] read "
+                << "[Week2 Day4] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
                 << ", buffered=" << connection.input_buffer.size()
                 << ", read_budget_remaining=" << budget->read_remaining
+                << ", global_inflight_bytes=" << global_inflight_bytes_
                 << '\n';
 
             // 这条检查必须尽早做，因为文档要求的是：
@@ -430,8 +538,6 @@ bool Server::CheckHeaderLimit(int fd) {
     return false;
 }
 
-// [Week2 Day3] Begin: 请求处理路径要尊重 closing 状态，并把关闭统一交给唯一入口。
-
 // 只要输入缓冲区里已经有完整 header，就循环拿出来解析。
 // 和 Day6 最大的不同点是：这里不再“有多少处理多少”，而是给每轮增加上限。
 // 一旦达到上限但 buffer 里还有完整请求，就把连接丢进 ReadyQueue，留到后续轮次继续处理。
@@ -453,7 +559,9 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
             break;
         }
 
+        const std::size_t input_size_before_pop = connection.input_buffer.size();
         std::string header = connection.input_buffer.PopNextHeader();
+        ReleaseInflightBytes(input_size_before_pop - connection.input_buffer.size());
         http::HttpRequest request;
         const http::ParseError parse_error = http_parser_.ParseRequestHeader(header, &request);
 
@@ -480,6 +588,17 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
                                       http::ToString(parse_error));
             return false;
         }
+
+        // [Week2 Day4] Begin: Body 大小限制在 header 解析成功后立刻检查。
+        // 这里不需要真正读取 body；只要 Content-Length 已经宣布超过 8MB，就应当立即 413 + close。
+        if (request.has_content_length() && request.content_length() > kMaxBodyBytes) {
+            SendErrorResponseAndClose(fd,
+                                      413,
+                                      "Payload Too Large",
+                                      "Content-Length exceeds 8MB body limit");
+            return false;
+        }
+        // [Week2 Day4] End
 
         LogParsedRequest(connection, request);
 
@@ -509,8 +628,6 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
     return true;
 }
 
-// [Week2 Day3] End
-
 // 把一条成功解析的请求摘要打印出来。
 // 这样 review 时可以直接看到：
 // - 请求方法是什么
@@ -519,7 +636,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day3] parsed request from "
+        << "[Week2 Day4] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -534,8 +651,6 @@ void Server::LogParsedRequest(const ClientConnection& connection, const http::Ht
 
     std::cout << '\n';
 }
-
-// [Week2 Day3] Begin: 响应写回链路需要配合 closing 状态，避免对已进入关闭流程的连接继续写。
 
 // 对已经通过 Day5 解析与校验的请求，启动最小 200 OK 响应流程。
 // 处理顺序是：
@@ -559,7 +674,9 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     // 如果前面已经有响应没写完，后面的响应必须直接追加到 outbuf 末尾，
     // 否则会破坏响应顺序。
     if (!connection.output_buffer.empty()) {
-        connection.output_buffer.append(response);
+        if (!AppendToOutputBuffer(fd, &connection, response)) {
+            return;
+        }
         UpdateClientPollMask(fd);
         return;
     }
@@ -567,10 +684,12 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     // 如果这轮写预算已经用完，就不要再尝试 write() 了。
     // 直接把响应放进 outbuf，等后续 EPOLLOUT 再继续发送。
     if (budget->write_remaining == 0) {
-        connection.output_buffer = response;
+        if (!ReplaceOutputBuffer(fd, &connection, response)) {
+            return;
+        }
         UpdateClientPollMask(fd);
         std::cout
-            << "[Week2 Day3] deferred 200 OK for "
+            << "[Week2 Day4] deferred 200 OK for "
             << connection.peer_endpoint
             << " because write budget is exhausted"
             << '\n';
@@ -590,22 +709,27 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
 
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day3] sent full 200 OK to "
+            << "[Week2 Day4] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
             << '\n';
         return;
     }
 
-    connection.output_buffer.assign(response.data() + written, response.size() - written);
+    if (!ReplaceOutputBuffer(fd,
+                             &connection,
+                             std::string_view(response.data() + written, response.size() - written))) {
+        return;
+    }
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day3] queued "
+        << "[Week2 Day4] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
         << ", write_budget_remaining=" << budget->write_remaining
+        << ", global_inflight_bytes=" << global_inflight_bytes_
         << '\n';
 }
 
@@ -648,7 +772,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
         if (budget->write_remaining == 0) {
             std::cout
-                << "[Week2 Day3] paused writing to "
+                << "[Week2 Day4] paused writing to "
                 << connection.peer_endpoint
                 << " because write budget is exhausted"
                 << '\n';
@@ -674,13 +798,15 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
         budget->write_remaining -= written;
         connection.output_buffer.erase(0, written);
+        ReleaseInflightBytes(written);
         std::cout
-            << "[Week2 Day3] flushed "
+            << "[Week2 Day4] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
             << ", remaining=" << connection.output_buffer.size()
             << ", write_budget_remaining=" << budget->write_remaining
+            << ", global_inflight_bytes=" << global_inflight_bytes_
             << '\n';
     }
 }
@@ -699,11 +825,6 @@ void Server::UpdateClientPollMask(int fd) {
 
     poller_.Modify(fd, events);
 }
-
-// [Week2 Day3] End
-
-// [Week2 Day3] Begin: 唯一关闭入口 + pending_close_queue 是这一阶段的核心生命周期约束。
-
 // 发送一个很小的错误响应，然后立即关闭连接。
 // 这里采用 best-effort：
 // 能写完就写完；写不完或 EAGAIN 也直接 close，不进入 Day6 的 outbuf 流程。
@@ -723,7 +844,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day3] sent error response "
+        << "[Week2 Day4] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -732,8 +853,6 @@ void Server::SendErrorResponseAndClose(int fd,
 
     CloseClientConnection(fd, close_reason);
 }
-
-// [Week2 Day3] End
 
 // 关闭并移除一个客户端连接。
 // 这是连接进入关闭流程的唯一入口。
@@ -762,7 +881,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     const std::string peer_endpoint = it->second.peer_endpoint;
 
     std::cout
-        << "[Week2 Day3] closing client "
+        << "[Week2 Day4] closing client "
         << peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
@@ -772,6 +891,15 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         poller_.Remove(fd);
         it->second.socket.reset();
     }
+
+    // [Week2 Day4] Begin: 连接关闭时，要把这个连接仍然占着的 inbuf/outbuf 字节全部归还给全局预算。
+    // 这里先释放计数，再清空缓冲区内容，避免 pending_close_queue 暂存对象时继续携带旧 buffer 大小。
+    const std::size_t buffered_bytes =
+        it->second.input_buffer.size() + it->second.output_buffer.size();
+    ReleaseInflightBytes(buffered_bytes);
+    it->second.input_buffer.Clear();
+    it->second.output_buffer.clear();
+    // [Week2 Day4] End
 
     PendingCloseEntry entry;
     entry.connection = std::move(it->second);

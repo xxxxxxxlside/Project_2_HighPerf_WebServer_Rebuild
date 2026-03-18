@@ -23,6 +23,11 @@ bool DynamicBuffer::empty() const noexcept {
     return storage_.empty();
 }
 
+// 清空缓冲区中所有还未处理的字节。
+void DynamicBuffer::Clear() noexcept {
+    storage_.clear();
+}
+
 // 查找第一个完整请求头的结束边界。
 // 返回的是 "\r\n\r\n" 这四个字节里第一个 '\r' 的位置。
 std::size_t DynamicBuffer::FindHeaderEnd() const noexcept {

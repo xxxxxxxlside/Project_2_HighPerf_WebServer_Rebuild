@@ -22,6 +22,9 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
     // 判断当前缓冲区是否为空。
     [[nodiscard]] bool empty() const noexcept;
+    // 清空整个缓冲区。
+    // 关闭连接时会用它把仍然残留的输入字节一次性丢弃。
+    void Clear() noexcept;
 
     // 返回第一个 "\r\n\r\n" 的起始位置。
     // 如果还没有找到完整请求头，则返回 std::string::npos。
