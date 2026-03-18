@@ -25,46 +25,51 @@ bool StopRequested() {
 Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
-// Initialize() 现在对应到 Week1 Day2。
-// 它会先创建监听 socket，再把监听 socket 切换为非阻塞。
+// Initialize() 现在对应到 Week1 Day3。
+// 它会依次完成：
+// 1. 创建监听 socket
+// 2. 把监听 socket 切成非阻塞
+// 3. 创建 epoll
+// 4. 把监听 fd 注册到 epoll
 void Server::Initialize() {
     // 第一步：完成 socket / SO_REUSEADDR / bind / listen。
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     // 第二步：把监听 socket 切换为非阻塞，给 Day2 的 accept 循环做准备。
     MakeListenSocketNonBlocking();
+
+    // [Week1 Day3] Begin: 把 Day2 的监听 socket 接入 epoll。
+    // 第三步：创建 epoll。
+    InitializePoller();
+    // 第四步：把监听 fd 加入 epoll。
+    RegisterListenSocket();
+    // [Week1 Day3] End
 }
 
 // Run() 的职责很简单：
 // 1. 确认监听 socket 已经初始化成功。
 // 2. 打印当前服务监听信息。
-// 3. 循环执行非阻塞 accept。
-// 4. 保持进程存活，直到收到退出信号。
+// 3. 进入单线程 Epoll LT 事件循环。
 void Server::Run() const {
-    if (!listen_fd_.valid()) {
+    if (!listen_fd_.valid() || !poller_.IsOpen()) {
         throw std::logic_error("server must be initialized before run()");
     }
 
     // 启动日志尽量直白，便于 review 时快速确认当前版本能力边界。
     std::cout
-        << "[Week1 Day2] listening on "
+        << "[Week1 Day3] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
+        << ", epoll=LT"
         << '\n';
 
-    // Day2 开始，主循环不再只是 sleep。
-    // 每一轮都会尝试把当前积压的新连接全部 accept 完，
-    // 直到 accept 返回 EAGAIN/EWOULDBLOCK。
+    // [Week1 Day3] Begin: 主循环从“轮询 + sleep”切到 epoll_wait 驱动。
+    // 从 Day3 开始，不再主动 sleep 轮询新连接，
+    // 而是交给 epoll_wait 在事件到来时唤醒当前线程。
     while (!StopRequested()) {
-        const std::size_t accepted_count = DrainAcceptQueue();
-        // 这里先用 sleep 做一个非常朴素的轮询循环。
-        // Day3 才会把这段轮询替换成真正的 epoll 事件循环。
-        if (accepted_count == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        RunEventLoopOnce();
     }
+    // [Week1 Day3] End
 }
 
 // 这个函数专门负责把监听 fd 切成非阻塞。
@@ -73,6 +78,51 @@ void Server::Run() const {
 void Server::MakeListenSocketNonBlocking() const {
     net::SetNonBlocking(listen_fd_.get());
 }
+
+// [Week1 Day3] Begin: epoll 初始化与事件分发函数。
+
+// 创建 epoll 实例。
+// 这是 Day3 从“手动轮询”切到“事件驱动”的第一步。
+void Server::InitializePoller() {
+    poller_.Open();
+}
+
+// 把监听 fd 注册到 epoll。
+// 这里用的只是 EPOLLIN，没有加 EPOLLET，
+// 所以这就是文档要求的 LT 模式。
+void Server::RegisterListenSocket() {
+    poller_.Add(listen_fd_.get(), EPOLLIN);
+}
+
+// 运行一轮 epoll 事件循环。
+// 当前版本只关心监听 fd 的可读事件。
+void Server::RunEventLoopOnce() const {
+    constexpr int kWaitTimeoutMs = 1000;
+    const std::vector<net::PollEvent> events = poller_.Wait(kWaitTimeoutMs);
+
+    for (const net::PollEvent& event : events) {
+        if (event.fd == listen_fd_.get()) {
+            HandleListenEvent(event.events);
+        }
+    }
+}
+
+// 处理监听 fd 的事件。
+// 对监听 socket 来说，EPOLLIN 表示“有新连接到达，可以继续 accept 了”。
+void Server::HandleListenEvent(std::uint32_t events) const {
+    if ((events & EPOLLIN) != 0U) {
+        const std::size_t accepted_count = DrainAcceptQueue();
+        if (accepted_count > 0) {
+            std::cout
+                << "[Week1 Day3] drained "
+                << accepted_count
+                << " connection(s) from listen queue via epoll LT"
+                << '\n';
+        }
+    }
+}
+
+// [Week1 Day3] End
 
 // 不断调用 TryAcceptOne()，把内核里当前已经排队的新连接尽量一次接完。
 // 这就是文档里说的“accept loop”。
@@ -94,7 +144,7 @@ std::size_t Server::DrainAcceptQueue() const {
 
         ++accepted_count;
         std::cout
-            << "[Week1 Day2] accepted connection from "
+            << "[Week1 Day3] accepted connection from "
             << accepted.peer_endpoint
             << ", fd=" << accepted.fd.get()
             << " (current stage closes it immediately after accept)"

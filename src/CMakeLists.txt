@@ -2,6 +2,8 @@ set(WEBSERVER_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include")
 
 add_library(webserver_net STATIC
     net/socket_utils.cpp
+    # [Week1 Day3] New: 把 epoll poller 编进 net 模块。
+    net/epoll_poller.cpp
 )
 target_include_directories(webserver_net PUBLIC "${WEBSERVER_INCLUDE_DIR}")
 target_link_libraries(webserver_net PUBLIC webserver_options)
