@@ -8,8 +8,6 @@
 
 namespace net {
 
-// [Week1 Day3] Begin: 新增 epoll 事件结果与 poller 封装。
-
 // PollEvent 是对 epoll 返回结果的一层轻量封装。
 // 当前阶段只需要关心：
 // 1. 哪个 fd 就绪了
@@ -19,13 +17,11 @@ struct PollEvent {
     std::uint32_t events = 0;
 };
 
-// EpollPoller 是 Week1 Day3 新增的最小 epoll 封装。
+// EpollPoller 是当前项目里最小的 epoll 封装。
 // 它的职责只保留三类动作：
 // 1. 创建 epoll 实例
 // 2. 注册 / 修改 / 删除 fd
 // 3. 等待一轮事件
-//
-// 当前项目只会把监听 fd 放进去，先完成最小 Epoll LT 事件循环。
 class EpollPoller {
 public:
     // 默认构造：先不创建 epoll fd，真正创建动作放到 Open()。
@@ -65,7 +61,5 @@ private:
     // 保存 epoll_wait 返回结果的缓冲区。
     std::vector<struct epoll_event> ready_events_;
 };
-
-// [Week1 Day3] End
 
 }  // namespace net

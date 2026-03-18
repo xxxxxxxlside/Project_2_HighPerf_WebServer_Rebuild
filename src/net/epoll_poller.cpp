@@ -7,7 +7,6 @@
 
 namespace {
 
-// [Week1 Day3] New: epoll 相关错误处理辅助函数。
 // 把 epoll 相关 errno 统一包装成异常，便于上层复用一套错误处理路径。
 void ThrowLastSystemError(const char* message) {
     throw std::system_error(errno, std::generic_category(), message);
@@ -17,10 +16,8 @@ void ThrowLastSystemError(const char* message) {
 
 namespace net {
 
-// [Week1 Day3] Begin: EpollPoller 的最小实现。
-
 // 构造函数先给事件缓冲区一个较小的初始容量。
-// 当前 Day3 只监听一个 fd，这个容量已经足够，但保留扩容逻辑方便继续演进。
+// 当前连接数还不大，这个默认值足够；如果事件打满，会在运行时自动扩容。
 EpollPoller::EpollPoller() : ready_events_(16) {}
 
 // 创建 epoll fd。
@@ -111,7 +108,5 @@ void EpollPoller::GrowReadyEventsIfNeeded(std::size_t ready_count) {
     }
     ready_events_.resize(ready_events_.size() * 2);
 }
-
-// [Week1 Day3] End
 
 }  // namespace net
