@@ -32,7 +32,7 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day4 static response\n";
+constexpr std::string_view kStaticOkBody = "Week2 Day5 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -49,6 +49,22 @@ constexpr std::size_t kMaxWriteBytesPerEvent = 256 * 1024;
 constexpr std::size_t kMaxBodyBytes = 8 * 1024 * 1024;
 constexpr std::size_t kMaxInflightBytes = 512ULL * 1024 * 1024;
 
+// Week2 Day5 在 accept 路径上加入按 IP 的 token bucket。
+constexpr double kIpBucketBurst = 200.0;
+constexpr double kIpBucketRefillPerSecond = 50.0;
+constexpr std::size_t kIpBucketMaxEntries = 100000;
+constexpr auto kIpBucketTtl = std::chrono::minutes(10);
+
+// 当前工程到这里仍然只支持 IPv4，对端地址字符串始终是 "ip:port"。
+// 因此这里直接按最后一个 ':' 把 IP 部分切出来即可。
+std::string ExtractIpFromPeerEndpoint(std::string_view peer_endpoint) {
+    const std::size_t colon = peer_endpoint.rfind(':');
+    if (colon == std::string_view::npos) {
+        return std::string(peer_endpoint);
+    }
+    return std::string(peer_endpoint.substr(0, colon));
+}
+
 }  // namespace
 
 // 构造函数只保存配置，不做系统调用。
@@ -56,7 +72,7 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week2 Day4 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week2 Day5 为止，这里仍然只做监听相关和事件循环相关的初始化。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
@@ -71,7 +87,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day4] listening on "
+        << "[Week2 Day5] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -128,7 +144,7 @@ void Server::FlushPendingCloseQueue() {
     }
 
     std::cout
-        << "[Week2 Day4] releasing "
+        << "[Week2 Day5] releasing "
         << pending_close_queue_.size()
         << " connection object(s) from pending_close_queue"
         << '\n';
@@ -209,7 +225,7 @@ void Server::EnqueueReadyConnection(int fd, const char* reason) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day4] queued client "
+        << "[Week2 Day5] queued client "
         << it->second.peer_endpoint
         << " into ReadyQueue, reason=" << reason
         << ", buffered=" << it->second.input_buffer.size()
@@ -246,7 +262,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day4] drained "
+            << "[Week2 Day5] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -254,7 +270,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
 }
 
 // 处理客户端 fd 的事件。
-// 到 Week2 Day4 为止，连接可能同时出现：
+// 到 Week2 Day5 为止，连接可能同时出现：
 // 1. 读事件：继续接收请求头
 // 2. 写事件：把 outbuf 里未发完的响应继续写出去
 // 3. 关闭/错误事件：直接回收连接
@@ -307,11 +323,20 @@ std::size_t Server::DrainAcceptQueue() {
 }
 
 // 接到新连接后，把它纳入最小连接表，并注册到 epoll。
+// 但在真正注册之前，要先过一遍按 IP 的 token bucket。
 void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     const int client_fd = accepted.fd.get();
     if (client_fd < 0) {
         throw std::logic_error("accepted socket must be valid");
     }
+
+    // [Week2 Day5] Begin: accept 成功不等于一定放行。
+    // 当前阶段新增的限流点就在这里：先检查这个来源 IP 是否还有 token，
+    // 只有放行后，连接才会真正进入 epoll 和 clients_。
+    if (!CheckIpRateLimitBeforeRegister(accepted)) {
+        return;
+    }
+    // [Week2 Day5] End
 
     ClientConnection connection;
     connection.socket = std::move(accepted.fd);
@@ -321,13 +346,134 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     clients_.emplace(client_fd, std::move(connection));
 
     std::cout
-        << "[Week2 Day4] registered client "
+        << "[Week2 Day5] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
         << '\n';
 }
 
-// [Week2 Day4] Begin: inflight budget 统一在 Server 内部串行维护。
+// [Week2 Day5] Begin: accept 路径上的 IP token bucket。
+
+// 在 accept 成功后、真正注册连接前检查该 IP 是否还有 token。
+// 设计上把这个检查放在“accept 之后、epoll 注册之前”，原因是：
+// 1. token 的统计口径就是“accept 成功消耗 1 个 token”
+// 2. 如果已经超限，就不应该再把这个连接纳入正常连接管理结构
+bool Server::CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted) {
+    const auto now = std::chrono::steady_clock::now();
+    CleanupExpiredIpBuckets(now);
+
+    const std::string ip = ExtractIpFromPeerEndpoint(accepted.peer_endpoint);
+    auto it = ip_token_buckets_.find(ip);
+
+    if (it == ip_token_buckets_.end()) {
+        while (ip_token_buckets_.size() >= kIpBucketMaxEntries && !ip_bucket_lru_.empty()) {
+            EvictOldestIpBucket();
+        }
+
+        ip_bucket_lru_.push_back(ip);
+
+        IpTokenBucketEntry entry;
+        entry.tokens = kIpBucketBurst;
+        entry.last_refill = now;
+        entry.last_seen = now;
+        entry.lru_iterator = std::prev(ip_bucket_lru_.end());
+
+        auto inserted = ip_token_buckets_.emplace(ip, std::move(entry));
+        it = inserted.first;
+    } else {
+        RefillIpBucket(&it->second, now);
+        TouchIpBucket(ip, &it->second, now);
+    }
+
+    // 口径要求是“每次 accept 成功消耗 1 个 token”。
+    // 所以新建 bucket 即使初始化为 burst，也要在这里立刻扣掉本次 accept 的 1 个 token。
+    if (it->second.tokens < 1.0) {
+        const std::string response = http::BuildSimpleErrorResponse(
+            429,
+            "Too Many Requests",
+            "Too Many Requests\n");
+
+        const bool write_ok = net::WriteBestEffort(accepted.fd.get(), response);
+        std::cout
+            << "[Week2 Day5] rejected accepted socket from "
+            << accepted.peer_endpoint
+            << ", reason=ip token bucket exhausted"
+            << ", write_complete=" << (write_ok ? "true" : "false")
+            << '\n';
+        return false;
+    }
+
+    it->second.tokens -= 1.0;
+    return true;
+}
+
+// 根据距离上次 refill 的时间，按固定速率补充 token。
+// 这里使用 double，是为了保留“小于 1 个 token”的小数补充量，避免限流呈现很硬的台阶效应。
+void Server::RefillIpBucket(IpTokenBucketEntry* bucket, std::chrono::steady_clock::time_point now) {
+    if (bucket == nullptr) {
+        throw std::invalid_argument("bucket must not be null");
+    }
+
+    const std::chrono::duration<double> elapsed = now - bucket->last_refill;
+    if (elapsed.count() <= 0.0) {
+        return;
+    }
+
+    bucket->tokens = std::min(
+        kIpBucketBurst,
+        bucket->tokens + elapsed.count() * kIpBucketRefillPerSecond);
+    bucket->last_refill = now;
+}
+
+// 访问一个已有 IP 条目时，要把它挪到 LRU 尾部，并更新 last_seen。
+// 这样后续 TTL 清理和容量淘汰都能优先处理最久没出现过的 IP。
+void Server::TouchIpBucket(const std::string& ip,
+                           IpTokenBucketEntry* bucket,
+                           std::chrono::steady_clock::time_point now) {
+    if (bucket == nullptr) {
+        throw std::invalid_argument("bucket must not be null");
+    }
+
+    ip_bucket_lru_.erase(bucket->lru_iterator);
+    ip_bucket_lru_.push_back(ip);
+    bucket->lru_iterator = std::prev(ip_bucket_lru_.end());
+    bucket->last_seen = now;
+}
+
+// 由于 LRU 顺序本身就是按最近访问排序的，所以清理过期条目时只需要从队头开始扫。
+// 一旦队头还没过期，后面的条目只会更新得更晚，也就可以立刻停止。
+void Server::CleanupExpiredIpBuckets(std::chrono::steady_clock::time_point now) {
+    while (!ip_bucket_lru_.empty()) {
+        const std::string& oldest_ip = ip_bucket_lru_.front();
+        auto it = ip_token_buckets_.find(oldest_ip);
+        if (it == ip_token_buckets_.end()) {
+            ip_bucket_lru_.pop_front();
+            continue;
+        }
+
+        if (now - it->second.last_seen <= kIpBucketTtl) {
+            return;
+        }
+
+        ip_bucket_lru_.pop_front();
+        ip_token_buckets_.erase(it);
+    }
+}
+
+// 当条目数达到上限时，按 LRU 淘汰最旧 IP。
+void Server::EvictOldestIpBucket() {
+    if (ip_bucket_lru_.empty()) {
+        return;
+    }
+
+    const std::string oldest_ip = ip_bucket_lru_.front();
+    ip_bucket_lru_.pop_front();
+    ip_token_buckets_.erase(oldest_ip);
+}
+
+// [Week2 Day5] End
+
+// inflight budget 统一在 Server 内部串行维护。
 
 // 在向 inbuf/outbuf 追加数据前，先检查全局 inflight budget 是否还有空间。
 // 这里故意只做“判定”，不直接递增计数；
@@ -429,8 +575,6 @@ bool Server::ReplaceOutputBuffer(int fd, ClientConnection* connection, std::stri
     return true;
 }
 
-// [Week2 Day4] End
-
 // 从客户端循环读数据到应用层缓冲区。
 // 只要还有预算且还有数据可读，就持续 read；
 // 遇到 EAGAIN 结束本轮，遇到预算耗尽则把连接加入 ReadyQueue 在后续轮次继续读。
@@ -460,7 +604,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
             }
 
             std::cout
-                << "[Week2 Day4] read "
+                << "[Week2 Day5] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
@@ -589,7 +733,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
             return false;
         }
 
-        // [Week2 Day4] Begin: Body 大小限制在 header 解析成功后立刻检查。
+        // Body 大小限制在 header 解析成功后立刻检查。
         // 这里不需要真正读取 body；只要 Content-Length 已经宣布超过 8MB，就应当立即 413 + close。
         if (request.has_content_length() && request.content_length() > kMaxBodyBytes) {
             SendErrorResponseAndClose(fd,
@@ -598,7 +742,6 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
                                       "Content-Length exceeds 8MB body limit");
             return false;
         }
-        // [Week2 Day4] End
 
         LogParsedRequest(connection, request);
 
@@ -636,7 +779,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day4] parsed request from "
+        << "[Week2 Day5] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -689,7 +832,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
         }
         UpdateClientPollMask(fd);
         std::cout
-            << "[Week2 Day4] deferred 200 OK for "
+            << "[Week2 Day5] deferred 200 OK for "
             << connection.peer_endpoint
             << " because write budget is exhausted"
             << '\n';
@@ -709,7 +852,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
 
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day4] sent full 200 OK to "
+            << "[Week2 Day5] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
             << '\n';
@@ -724,7 +867,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day4] queued "
+        << "[Week2 Day5] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
@@ -772,7 +915,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
         if (budget->write_remaining == 0) {
             std::cout
-                << "[Week2 Day4] paused writing to "
+                << "[Week2 Day5] paused writing to "
                 << connection.peer_endpoint
                 << " because write budget is exhausted"
                 << '\n';
@@ -800,7 +943,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
         connection.output_buffer.erase(0, written);
         ReleaseInflightBytes(written);
         std::cout
-            << "[Week2 Day4] flushed "
+            << "[Week2 Day5] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
@@ -844,7 +987,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day4] sent error response "
+        << "[Week2 Day5] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -881,7 +1024,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     const std::string peer_endpoint = it->second.peer_endpoint;
 
     std::cout
-        << "[Week2 Day4] closing client "
+        << "[Week2 Day5] closing client "
         << peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
@@ -892,14 +1035,13 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         it->second.socket.reset();
     }
 
-    // [Week2 Day4] Begin: 连接关闭时，要把这个连接仍然占着的 inbuf/outbuf 字节全部归还给全局预算。
+    // 连接关闭时，要把这个连接仍然占着的 inbuf/outbuf 字节全部归还给全局预算。
     // 这里先释放计数，再清空缓冲区内容，避免 pending_close_queue 暂存对象时继续携带旧 buffer 大小。
     const std::size_t buffered_bytes =
         it->second.input_buffer.size() + it->second.output_buffer.size();
     ReleaseInflightBytes(buffered_bytes);
     it->second.input_buffer.Clear();
     it->second.output_buffer.clear();
-    // [Week2 Day4] End
 
     PendingCloseEntry entry;
     entry.connection = std::move(it->second);

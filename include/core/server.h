@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <deque>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -15,7 +17,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day4 为止，它的职责是：
+// 到 Week2 Day5 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -29,6 +31,7 @@ namespace core {
 // 11. 对单连接单轮读/写量加预算，避免一个连接长时间独占 EventLoop
 // 12. 使用唯一关闭入口和 pending_close_queue，避免关闭过程中的 UAF 风险
 // 13. 对 inbuf/outbuf 维护全局 inflight budget，并对过大 Content-Length 返回 413
+// 14. 在 accept 路径上增加按 IP 计数的 token bucket，限制瞬时接入速率
 class Server {
 public:
     // 构造函数：
@@ -96,6 +99,19 @@ private:
         ClientConnection connection;
     };
 
+    // IpTokenBucketEntry 保存一个来源 IP 当前的限流状态。
+    // 当前阶段只在 accept 路径上使用它，所以结构里只保留最小字段：
+    // 1. tokens：当前可用 token 数
+    // 2. last_refill：上次补充 token 的时间
+    // 3. last_seen：上次看到这个 IP 的时间，用于 TTL/LRU
+    // 4. lru_iterator：指向 LRU 链表中的位置，方便 O(1) 更新
+    struct IpTokenBucketEntry {
+        double tokens = 0.0;
+        std::chrono::steady_clock::time_point last_refill {};
+        std::chrono::steady_clock::time_point last_seen {};
+        std::list<std::string>::iterator lru_iterator;
+    };
+
     // 把监听 socket 设置为非阻塞。
     void MakeListenSocketNonBlocking() const;
     // 创建并初始化 epoll。
@@ -121,7 +137,7 @@ private:
     // 对监听 socket 来说，“可读”意味着有新连接可以 accept。
     void HandleListenEvent(std::uint32_t events);
     // 处理客户端连接上的事件。
-    // 到 Week2 Day4 为止，这里主要区分三类情况：
+    // 到 Week2 Day5 为止，这里主要区分三类情况：
     // 1. 对端关闭 / 错误
     // 2. 可读事件：继续收 header 并解析
     // 3. 可写事件：继续把 outbuf 中没写完的响应刷出去
@@ -151,7 +167,7 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
-    // [Week2 Day4] New: 在向 inbuf/outbuf 追加数据前先做全局 inflight budget 检查。
+    // 在向 inbuf/outbuf 追加数据前先做全局 inflight budget 检查。
     // 这一步只负责判定“能不能继续追加”，真正的计数递增只会发生在追加成功之后。
     bool TryReserveInflightBytes(int fd, std::size_t add_bytes, const char* reason);
     // 按“已释放的 buffer 字节数”回收全局 inflight budget。
@@ -162,6 +178,19 @@ private:
     bool AppendToOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
     // 带 inflight budget 检查地替换整个输出缓冲区。
     bool ReplaceOutputBuffer(int fd, ClientConnection* connection, std::string_view data);
+    // [Week2 Day5] New: 在 accept 成功后、正式注册进 epoll 前，检查该 IP 是否还有可用 token。
+    // 返回 false 表示当前连接已经被 429 + close 拒绝，不应再继续注册。
+    bool CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted);
+    // 按 elapsed time 给一个 IP bucket 补充 token。
+    void RefillIpBucket(IpTokenBucketEntry* bucket, std::chrono::steady_clock::time_point now);
+    // 把一个 bucket 更新成“最近访问”，维持 LRU 顺序。
+    void TouchIpBucket(const std::string& ip,
+                       IpTokenBucketEntry* bucket,
+                       std::chrono::steady_clock::time_point now);
+    // 清理超过 TTL 的旧 bucket，避免不同 IP 无限增长导致额外内存占用。
+    void CleanupExpiredIpBuckets(std::chrono::steady_clock::time_point now);
+    // 当 bucket 总数到达上限时，按 LRU 淘汰最旧条目。
+    void EvictOldestIpBucket();
     // 尝试写出一个小的错误响应，然后关闭连接。
     void SendErrorResponseAndClose(int fd,
                                    int status_code,
@@ -193,8 +222,11 @@ private:
     std::vector<PendingCloseEntry> pending_close_queue_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
-    // [Week2 Day4] New: 统计当前所有活跃连接 inbuf + outbuf 占用的总字节数。
+    // 统计当前所有活跃连接 inbuf + outbuf 占用的总字节数。
     std::size_t global_inflight_bytes_ = 0;
+    // [Week2 Day5] New: ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
+    std::list<std::string> ip_bucket_lru_;
+    std::unordered_map<std::string, IpTokenBucketEntry> ip_token_buckets_;
 
     // Day5 引入的最小 HTTP 头解析器。
     http::HttpParser http_parser_;
