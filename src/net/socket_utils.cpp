@@ -203,10 +203,30 @@ bool WriteBestEffort(int fd, std::string_view data) {
     std::size_t offset = 0;
 
     while (offset < data.size()) {
-        const ssize_t written = ::write(fd, data.data() + offset, data.size() - offset);
+        try {
+            const std::size_t written = WriteSomeNonBlocking(fd, data.substr(offset));
+            if (written == 0) {
+                return false;
+            }
+            offset += written;
+        } catch (const std::system_error&) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// 只尝试执行“当前这一轮”的非阻塞写。
+// Day6 的 outbuf 逻辑正是依赖这个函数来判断：
+// - 这次是不是已经写完
+// - 是不是只写了一部分
+// - 是不是暂时不可写，需要等下一次 EPOLLOUT
+std::size_t WriteSomeNonBlocking(int fd, std::string_view data) {
+    while (true) {
+        const ssize_t written = ::write(fd, data.data(), data.size());
         if (written > 0) {
-            offset += static_cast<std::size_t>(written);
-            continue;
+            return static_cast<std::size_t>(written);
         }
 
         if (written < 0 && errno == EINTR) {
@@ -214,13 +234,11 @@ bool WriteBestEffort(int fd, std::string_view data) {
         }
 
         if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return false;
+            return 0;
         }
 
-        return false;
+        ThrowLastSystemError("write() failed");
     }
-
-    return true;
 }
 
 // 把 host 和 port 拼成 "host:port" 字符串。

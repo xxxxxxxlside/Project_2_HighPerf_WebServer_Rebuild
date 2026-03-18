@@ -12,7 +12,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week1 Day5 为止，它的职责是：
+// 到 Week1 Day6 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -20,6 +20,8 @@ namespace core {
 // 5. 接收连接并读取数据
 // 6. 用动态缓冲区按 "\r\n\r\n" 切分完整请求头
 // 7. 对完整请求头做最小 HTTP 解析和协议边界防御
+// 8. 对合法 GET/POST 生成静态 200 OK 响应
+// 9. 当一次 write() 写不完时，把剩余数据放进 outbuf，等待后续 EPOLLOUT 继续发送
 class Server {
 public:
     // 构造函数：
@@ -53,6 +55,12 @@ private:
         // 应用层输入缓冲区。
         // 这里会暂存多次 read() 收到的数据，直到能够按 "\r\n\r\n" 切出完整请求头。
         net::DynamicBuffer input_buffer;
+        // [Week1 Day6] New: 输出缓冲区保存“一次 write() 没写完”的响应尾部。
+        // 只有在非阻塞 write 遇到 EAGAIN 或只写出一部分数据时，才会把剩余字节放到这里。
+        std::string output_buffer;
+        // 当前阶段所有响应都采用 "Connection: close"。
+        // 因此只要输出缓冲区被清空，就可以直接回收这个连接。
+        bool close_after_write = false;
     };
 
     // 把监听 socket 设置为非阻塞。
@@ -68,7 +76,11 @@ private:
     // 处理监听 fd 上的可读事件。
     // 对监听 socket 来说，“可读”意味着有新连接可以 accept。
     void HandleListenEvent(std::uint32_t events);
-    // 处理客户端连接上的可读事件。
+    // 处理客户端连接上的事件。
+    // 到 Day6 为止，这里主要区分三类情况：
+    // 1. 对端关闭 / 错误
+    // 2. 可读事件：继续收 header 并解析
+    // 3. 可写事件：继续把 outbuf 中没写完的响应刷出去
     void HandleClientEvent(int fd, std::uint32_t events);
 
     // 循环 accept 新连接，直到当前没有更多连接可接。
@@ -84,6 +96,10 @@ private:
     bool CheckHeaderLimit(int fd);
     // 记录一条成功解析的请求摘要，方便 review 时观察解析结果。
     void LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const;
+    // 对一个已经通过 Day5 校验的合法请求，启动 Day6 的静态 200 OK 响应流程。
+    void StartOkResponse(int fd, const http::HttpRequest& request);
+    // 继续把 outbuf 里还没发完的数据刷到 socket。
+    void FlushClientOutput(int fd);
     // 尝试写出一个小的错误响应，然后关闭连接。
     void SendErrorResponseAndClose(int fd,
                                    int status_code,
@@ -104,7 +120,7 @@ private:
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
 
-    // [Week1 Day5] New: Day5 开始引入最小 HTTP 头解析器。
+    // Day5 引入的最小 HTTP 头解析器。
     http::HttpParser http_parser_;
 };
 

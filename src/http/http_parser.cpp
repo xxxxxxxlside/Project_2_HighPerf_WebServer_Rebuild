@@ -5,8 +5,6 @@
 
 namespace http {
 
-// [Week1 Day5] Begin: 最小 HTTP 请求头解析与协议边界检查。
-
 ParseError HttpParser::ParseRequestHeader(std::string_view header, HttpRequest* request) const {
     if (request == nullptr) {
         return ParseError::kBadRequest;
@@ -172,8 +170,6 @@ bool HttpParser::ParseContentLengthValue(std::string_view value, std::size_t* co
     }
     return parsed == trimmed.size();
 }
-
-// [Week1 Day5] End
 
 const char* ToString(ParseError error) noexcept {
     switch (error) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <string>
@@ -73,8 +74,20 @@ bool TryAcceptOne(int listen_fd, AcceptedSocket* accepted);
 // - 如果中途遇到 EAGAIN / EWOULDBLOCK / 其它错误，返回 false
 //
 // 这个函数只适合当前阶段这种“很短的错误响应 + 立刻 close”场景，
-// 不适合后续 Day6 的 outbuf / EPOLLOUT 持续写回逻辑。
+// 不适合 Day6 正常 `200 OK` 响应那种“可能要分多轮写完”的 outbuf / EPOLLOUT 持续写回逻辑。
 bool WriteBestEffort(int fd, std::string_view data);
+
+// Day6 开始需要“只写一轮”，以便区分三种结果：
+// 1. 全写完
+// 2. 只写出一部分
+// 3. 遇到 EAGAIN，当前轮暂时写不动
+//
+// 返回值表示本次实际写出的字节数：
+// - 大于 0：成功写出这些字节
+// - 等于 0：当前是非阻塞不可写状态（EAGAIN / EWOULDBLOCK）
+//
+// 其它真正的系统错误会抛异常，让上层决定是否关闭连接。
+std::size_t WriteSomeNonBlocking(int fd, std::string_view data);
 
 // 生成 "host:port" 形式的可读字符串，便于日志输出。
 std::string DescribeEndpoint(const std::string& host, std::uint16_t port);
