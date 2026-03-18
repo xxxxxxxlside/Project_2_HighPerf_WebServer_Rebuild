@@ -1,17 +1,29 @@
 build/
+build-*/
 
 *.o
+*.obj
 *.a
 *.so
+*.so.*
+*.dylib
+*.out
 *.log
 
 results/*/metrics.log
+results/*/machine.txt
+results/*/build_flags.txt
+results/*/bench_cmd.txt
+results/*/latency_samples.txt
+results/*/summary.md
 
 .vscode/
 .idea/
+.cache/
 
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 compile_commands.json
 Makefile
+Testing/
