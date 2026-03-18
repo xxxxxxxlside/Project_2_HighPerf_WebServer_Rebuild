@@ -196,6 +196,33 @@ bool TryAcceptOne(int listen_fd, AcceptedSocket* accepted) {
     return true;
 }
 
+// 尽量把一段小响应写出去。
+// 由于当前 socket 是非阻塞的，所以 write() 可能在中途返回 EAGAIN；
+// 一旦出现这种情况，当前阶段就直接视为“写不完”，交给上层 close。
+bool WriteBestEffort(int fd, std::string_view data) {
+    std::size_t offset = 0;
+
+    while (offset < data.size()) {
+        const ssize_t written = ::write(fd, data.data() + offset, data.size() - offset);
+        if (written > 0) {
+            offset += static_cast<std::size_t>(written);
+            continue;
+        }
+
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return false;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
 // 把 host 和 port 拼成 "host:port" 字符串。
 // 主要给日志输出使用。
 std::string DescribeEndpoint(const std::string& host, std::uint16_t port) {

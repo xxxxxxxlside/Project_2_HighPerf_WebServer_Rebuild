@@ -8,12 +8,21 @@ add_library(webserver_net STATIC
 target_include_directories(webserver_net PUBLIC "${WEBSERVER_INCLUDE_DIR}")
 target_link_libraries(webserver_net PUBLIC webserver_options)
 
+add_library(webserver_http STATIC
+    http/http_request.cpp
+    http/http_parser.cpp
+    http/http_response.cpp
+)
+target_include_directories(webserver_http PUBLIC "${WEBSERVER_INCLUDE_DIR}")
+target_link_libraries(webserver_http PUBLIC webserver_options)
+
 add_library(webserver_core STATIC
     core/server.cpp
 )
 target_include_directories(webserver_core PUBLIC "${WEBSERVER_INCLUDE_DIR}")
 target_link_libraries(webserver_core
     PUBLIC
+        webserver_http
         webserver_net
         webserver_options
 )
@@ -24,6 +33,7 @@ add_executable(webserver
 target_link_libraries(webserver
     PRIVATE
         webserver_core
+        webserver_http
         webserver_net
         webserver_options
 )

@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "http/http_parser.h"
 #include "net/dynamic_buffer.h"
 #include "net/epoll_poller.h"
 #include "net/socket_utils.h"
@@ -11,13 +12,14 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week1 Day4 为止，它的职责是：
+// 到 Week1 Day5 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
 // 4. 维护最小连接表
 // 5. 接收连接并读取数据
 // 6. 用动态缓冲区按 "\r\n\r\n" 切分完整请求头
+// 7. 对完整请求头做最小 HTTP 解析和协议边界防御
 class Server {
 public:
     // 构造函数：
@@ -42,7 +44,7 @@ public:
     [[nodiscard]] int listening_fd() const noexcept;
 
 private:
-    // ClientConnection 保存一个客户端连接在 Day4 阶段所需的最小状态。
+    // ClientConnection 保存一个客户端连接在当前阶段所需的最小状态。
     struct ClientConnection {
         // 客户端 socket fd，由 RAII 负责自动关闭。
         net::UniqueFd socket;
@@ -77,7 +79,16 @@ private:
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd);
     // 处理某个连接输入缓冲区里已经完整的请求头。
-    void ProcessBufferedHeaders(ClientConnection& connection);
+    void ProcessBufferedHeaders(int fd);
+    // 当还没找到 "\r\n\r\n" 时，检查请求头是否已经超过 8192 字节。
+    bool CheckHeaderLimit(int fd);
+    // 记录一条成功解析的请求摘要，方便 review 时观察解析结果。
+    void LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const;
+    // 尝试写出一个小的错误响应，然后关闭连接。
+    void SendErrorResponseAndClose(int fd,
+                                   int status_code,
+                                   const char* reason_phrase,
+                                   const char* close_reason);
     // 关闭并移除一个客户端连接。
     void CloseClientConnection(int fd, const char* reason);
 
@@ -90,8 +101,11 @@ private:
     // epoll 封装对象。当前管理监听 fd 和客户端 fd。
     net::EpollPoller poller_;
 
-    // [Week1 Day4] New: Day4 开始引入最小连接表和应用层输入缓冲区。
+    // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
+
+    // [Week1 Day5] New: Day5 开始引入最小 HTTP 头解析器。
+    http::HttpParser http_parser_;
 };
 
 }  // namespace core

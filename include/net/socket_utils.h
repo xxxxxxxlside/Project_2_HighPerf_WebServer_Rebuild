@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace net {
 
@@ -65,6 +66,15 @@ struct AcceptedSocket {
 //
 // Day2 这里会把新连接直接设置为非阻塞，方便 Day3 以后继续往下接 epoll。
 bool TryAcceptOne(int listen_fd, AcceptedSocket* accepted);
+
+// 尝试把一小段响应数据尽量写到 socket 上。
+// 这里采用 best-effort 语义：
+// - 如果全部写完，返回 true
+// - 如果中途遇到 EAGAIN / EWOULDBLOCK / 其它错误，返回 false
+//
+// 这个函数只适合当前阶段这种“很短的错误响应 + 立刻 close”场景，
+// 不适合后续 Day6 的 outbuf / EPOLLOUT 持续写回逻辑。
+bool WriteBestEffort(int fd, std::string_view data);
 
 // 生成 "host:port" 形式的可读字符串，便于日志输出。
 std::string DescribeEndpoint(const std::string& host, std::uint16_t port);
