@@ -11,9 +11,15 @@ namespace core {
 // 创建监听 socket，并在运行时保持进程存活。
 class Server {
 public:
+    // 构造函数：
+    // 把监听地址、端口和 backlog 保存下来，
+    // 真正创建 socket 的动作放到 Initialize() 里做。
     Server(std::string host, std::uint16_t port, int backlog);
+    // 析构函数使用默认实现即可；
+    // 因为 listen_fd_ 是 RAII 对象，会自动 close。
     ~Server() = default;
 
+    // 禁止拷贝，避免同一个监听 fd 被多个对象误管理。
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
@@ -22,6 +28,7 @@ public:
     // 进入运行态，直到收到退出信号。
     void Run() const;
 
+    // 返回当前监听 fd，主要用于调试和排错。
     [[nodiscard]] int listening_fd() const noexcept;
 
 private:

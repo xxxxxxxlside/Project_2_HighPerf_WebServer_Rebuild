@@ -18,7 +18,8 @@ void ThrowLastSystemError(const char* message) {
     throw std::system_error(errno, std::generic_category(), message);
 }
 
-// 当前版本只处理 IPv4，后续若要扩展 IPv6，可以从这里继续抽象。
+// 根据 host 和 port 组装 sockaddr_in。
+// Day1 当前只支持 IPv4，所以这里直接返回 sockaddr_in。
 sockaddr_in BuildSockAddr(const std::string& host, std::uint16_t port) {
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
@@ -40,20 +41,29 @@ sockaddr_in BuildSockAddr(const std::string& host, std::uint16_t port) {
 
 namespace net {
 
+// 这里保存一个全局退出标记。
+// main.cpp 在收到 SIGINT / SIGTERM 时会把它置 1，
+// Server::Run() 通过轮询它来退出运行循环。
 volatile std::sig_atomic_t& GlobalStopFlag() noexcept {
     static volatile std::sig_atomic_t stop_flag = 0;
     return stop_flag;
 }
 
+// 直接接管传进来的 fd。
 UniqueFd::UniqueFd(int fd) noexcept : fd_(fd) {}
 
+// 析构函数负责自动释放 fd。
 UniqueFd::~UniqueFd() {
     // 析构时统一 close，保证异常路径也不泄漏 fd。
     reset();
 }
 
+// 移动构造：
+// 从 other 手里拿走 fd，并把 other 置空。
 UniqueFd::UniqueFd(UniqueFd&& other) noexcept : fd_(other.release()) {}
 
+// 移动赋值：
+// 先释放自己原来持有的 fd，再接管 other 的 fd。
 UniqueFd& UniqueFd::operator=(UniqueFd&& other) noexcept {
     if (this != &other) {
         reset(other.release());
@@ -61,14 +71,18 @@ UniqueFd& UniqueFd::operator=(UniqueFd&& other) noexcept {
     return *this;
 }
 
+// 返回当前托管的原始 fd。
 int UniqueFd::get() const noexcept {
     return fd_;
 }
 
+// 判断当前是否持有有效 fd。
 bool UniqueFd::valid() const noexcept {
     return fd_ >= 0;
 }
 
+// 交出 fd 所有权，但不负责 close。
+// 调用后当前对象会变成“空对象”状态。
 int UniqueFd::release() noexcept {
     // 释放所有权后把自身置空，避免重复 close。
     const int fd = fd_;
@@ -76,6 +90,8 @@ int UniqueFd::release() noexcept {
     return fd;
 }
 
+// 重置当前对象托管的 fd。
+// 如果原来持有有效 fd，会先 close，再保存新的 fd。
 void UniqueFd::reset(int fd) noexcept {
     if (fd_ >= 0) {
         ::close(fd_);
@@ -83,26 +99,36 @@ void UniqueFd::reset(int fd) noexcept {
     fd_ = fd;
 }
 
+// 这是 Day1 最核心的工具函数。
+// 它会一次性完成：
+// 1. socket()
+// 2. setsockopt(SO_REUSEADDR)
+// 3. bind()
+// 4. listen()
 UniqueFd CreateListenSocket(const std::string& host,
                             std::uint16_t port,
                             int backlog) {
     // Day1 的最小闭环就在这里收口，main/server 不再散落 socket 细节。
+    // 第一步：创建 TCP 监听 socket。
     UniqueFd listen_fd(::socket(AF_INET, SOCK_STREAM, 0));
     if (!listen_fd.valid()) {
         ThrowLastSystemError("socket() failed");
     }
 
     // 允许快速重启服务时复用地址，避免 TIME_WAIT 导致 bind 失败。
+    // 第二步：打开 SO_REUSEADDR，方便服务重启时快速复用地址。
     const int reuse_addr = 1;
     if (::setsockopt(listen_fd.get(), SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
         ThrowLastSystemError("setsockopt(SO_REUSEADDR) failed");
     }
 
+    // 第三步：把地址和端口绑定到这个 socket 上。
     const sockaddr_in addr = BuildSockAddr(host, port);
     if (::bind(listen_fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
         ThrowLastSystemError("bind() failed");
     }
 
+    // 第四步：把 socket 切换到监听状态。
     if (::listen(listen_fd.get(), backlog) != 0) {
         ThrowLastSystemError("listen() failed");
     }
@@ -110,6 +136,8 @@ UniqueFd CreateListenSocket(const std::string& host,
     return listen_fd;
 }
 
+// 把 host 和 port 拼成 "host:port" 字符串。
+// 主要给日志输出使用。
 std::string DescribeEndpoint(const std::string& host, std::uint16_t port) {
     // 输出日志时统一走这里，避免各处手拼 host:port。
     std::ostringstream oss;
