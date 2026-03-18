@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstddef>
 #include <iostream>
 #include <stdexcept>
@@ -31,8 +32,8 @@ constexpr std::size_t kReadChunkSize = 4096;
 // Day5 文档里明确给出的 header 上限。
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
-// Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day6 static response\n";
+// 当前阶段先继续用静态文本把正常响应链路走通。
+constexpr std::string_view kStaticOkBody = "Week3 Day1 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -59,6 +60,10 @@ constexpr auto kIpBucketTtl = std::chrono::minutes(10);
 // 这里写死默认值 200k，和文档保持一致；后续如果项目再引入配置系统，再把它接成可配置项。
 constexpr std::size_t kMaxConnections = 200000;
 
+// Week3 Day1 引入最基础的超时打底。
+constexpr auto kHeaderTimeout = std::chrono::seconds(10);
+constexpr auto kIdleKeepAliveTimeout = std::chrono::seconds(60);
+
 // 当前工程到这里仍然只支持 IPv4，对端地址字符串始终是 "ip:port"。
 // 因此这里直接按最后一个 ':' 把 IP 部分切出来即可。
 std::string ExtractIpFromPeerEndpoint(std::string_view peer_endpoint) {
@@ -69,6 +74,19 @@ std::string ExtractIpFromPeerEndpoint(std::string_view peer_endpoint) {
     return std::string(peer_endpoint.substr(0, colon));
 }
 
+std::string LowercaseCopy(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+    for (const char ch : text) {
+        result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return result;
+}
+
+bool ContainsHeaderToken(std::string_view header_value, std::string_view token) {
+    return LowercaseCopy(header_value).find(std::string(token)) != std::string::npos;
+}
+
 }  // namespace
 
 // 构造函数只保存配置，不做系统调用。
@@ -76,7 +94,7 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week2 Day5 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week3 Day1 为止，这里仍然只做监听相关和事件循环相关的初始化。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
@@ -91,7 +109,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day6] listening on "
+        << "[Week3 Day1] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -121,17 +139,91 @@ void Server::RegisterListenSocket() {
 // 跑一轮 epoll_wait，然后把返回的事件逐个分发出去。
 void Server::RunEventLoopOnce() {
     ProcessReadyQueue();
+    ProcessExpiredTimers();
 
-    // 如果 ReadyQueue 里还有待处理连接，就不要在 epoll_wait 上长时间阻塞，
-    // 这样下一轮可以尽快继续把这些“用户态 buffer 中已就绪”的请求处理掉。
-    const int wait_timeout_ms = ready_queue_.empty() ? 1000 : 0;
+    // ReadyQueue 和最早一个超时任务会共同决定 epoll_wait 最多能阻塞多久。
+    // 这样没有网络事件时，也能按时处理 header_timeout / idle_keepalive_timeout。
+    const int wait_timeout_ms = ComputePollTimeoutMs();
     const std::vector<net::PollEvent> events = poller_.Wait(wait_timeout_ms);
 
     for (const net::PollEvent& event : events) {
         HandlePollEvent(event);
     }
 
+    ProcessExpiredTimers();
     FlushPendingCloseQueue();
+}
+
+void Server::ProcessExpiredTimers() {
+    const auto now = std::chrono::steady_clock::now();
+
+    while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
+        const TimerEntry timer = timer_heap_.top();
+        timer_heap_.pop();
+
+        auto it = clients_.find(timer.fd);
+        if (it == clients_.end() || it->second.closing) {
+            continue;
+        }
+
+        ClientConnection& connection = it->second;
+        if (connection.connection_id != timer.connection_id) {
+            continue;
+        }
+
+        if (timer.kind == TimerKind::kHeader) {
+            if (!connection.header_timeout_armed ||
+                connection.header_timeout_generation != timer.generation) {
+                continue;
+            }
+            connection.header_timeout_armed = false;
+            ++connection.header_timeout_generation;
+        } else {
+            if (!connection.idle_timeout_armed ||
+                connection.idle_timeout_generation != timer.generation) {
+                continue;
+            }
+            connection.idle_timeout_armed = false;
+            ++connection.idle_timeout_generation;
+        }
+
+        std::cout
+            << "[Week3 Day1] timer expired for "
+            << connection.peer_endpoint
+            << ", kind=" << (timer.kind == TimerKind::kHeader
+                                  ? "header_timeout"
+                                  : "idle_keepalive_timeout")
+            << '\n';
+
+        if (timer.kind == TimerKind::kHeader) {
+            CloseClientConnection(timer.fd, "header timeout exceeded before a complete request header arrived");
+        } else {
+            CloseClientConnection(timer.fd, "idle keep-alive timeout exceeded");
+        }
+    }
+}
+
+int Server::ComputePollTimeoutMs() const {
+    if (!ready_queue_.empty()) {
+        return 0;
+    }
+
+    if (timer_heap_.empty()) {
+        return 1000;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto next_deadline = timer_heap_.top().deadline;
+    if (next_deadline <= now) {
+        return 0;
+    }
+
+    const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(next_deadline - now);
+    if (wait.count() <= 0) {
+        return 0;
+    }
+
+    return wait.count() > 1000 ? 1000 : static_cast<int>(wait.count());
 }
 
 // 在本轮 EventLoop 末尾统一释放 pending_close_queue 中保存的连接对象。
@@ -148,7 +240,7 @@ void Server::FlushPendingCloseQueue() {
     }
 
     std::cout
-        << "[Week2 Day6] releasing "
+        << "[Week3 Day1] releasing "
         << pending_close_queue_.size()
         << " connection object(s) from pending_close_queue"
         << '\n';
@@ -229,7 +321,7 @@ void Server::EnqueueReadyConnection(int fd, const char* reason) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day6] queued client "
+        << "[Week3 Day1] queued client "
         << it->second.peer_endpoint
         << " into ReadyQueue, reason=" << reason
         << ", buffered=" << it->second.input_buffer.size()
@@ -266,7 +358,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day6] drained "
+            << "[Week3 Day1] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -305,6 +397,15 @@ void Server::HandleClientEvent(int fd, std::uint32_t events) {
     }
 
     if ((events & EPOLLIN) != 0U) {
+        if (it->second.idle_timeout_armed) {
+            DisarmIdleKeepAliveTimeout(&it->second);
+            ArmHeaderTimeout(fd, std::chrono::steady_clock::now());
+
+            it = clients_.find(fd);
+            if (it == clients_.end() || it->second.closing) {
+                return;
+            }
+        }
         ReadFromClient(fd, &budget);
     }
 }
@@ -345,19 +446,21 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     ClientConnection connection;
     connection.socket = std::move(accepted.fd);
     connection.peer_endpoint = std::move(accepted.peer_endpoint);
+    connection.connection_id = next_connection_id_++;
 
     poller_.Add(client_fd, EPOLLIN | EPOLLRDHUP);
     clients_.emplace(client_fd, std::move(connection));
     ++active_connection_count_;
+    ArmHeaderTimeout(client_fd, std::chrono::steady_clock::now());
 
     std::cout
-        << "[Week2 Day6] registered client "
+        << "[Week3 Day1] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
         << ", active_connections=" << active_connection_count_
         << '\n';
 
-    // [Week2 Day6] Begin:
+    // [Week3 Day1] Begin:
     // 连接已经纳入 epoll 和 clients_ 之后，立刻检查全局连接数上限。
     // 这里故意放在“注册之后”而不是“注册之前”，是为了严格遵守文档里的计数口径：
     // 1. accept 成功并纳入管理后，活跃连接数先 +1
@@ -368,10 +471,10 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     if (!EnforceConnectionLimitAfterRegister(client_fd)) {
         return;
     }
-    // [Week2 Day6] End
+    // [Week3 Day1] End
 }
 
-// [Week2 Day6] New:
+// [Week3 Day1] New:
 // 这个函数专门收口“accept 成功后发现总连接数超限”的分支。
 // 它不直接手写 close 逻辑，而是继续复用唯一关闭入口，原因有两个：
 // 1. 连接计数的递减口径已经写进关闭入口，避免一处忘减导致统计失真
@@ -388,7 +491,7 @@ bool Server::EnforceConnectionLimitAfterRegister(int fd) {
 
     ++conn_reject_total_;
     std::cout
-        << "[Week2 Day6] rejecting client "
+        << "[Week3 Day1] rejecting client "
         << it->second.peer_endpoint
         << " because active connection limit was exceeded"
         << ", active_connections=" << active_connection_count_
@@ -443,7 +546,7 @@ bool Server::CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted)
 
         const bool write_ok = net::WriteBestEffort(accepted.fd.get(), response);
         std::cout
-            << "[Week2 Day6] rejected accepted socket from "
+            << "[Week3 Day1] rejected accepted socket from "
             << accepted.peer_endpoint
             << ", reason=ip token bucket exhausted"
             << ", write_complete=" << (write_ok ? "true" : "false")
@@ -542,6 +645,94 @@ bool Server::TryReserveInflightBytes(int fd, std::size_t add_bytes, const char* 
                               "Service Unavailable",
                               reason);
     return false;
+}
+
+void Server::ArmHeaderTimeout(int fd, std::chrono::steady_clock::time_point now) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end() || it->second.closing) {
+        return;
+    }
+
+    ClientConnection& connection = it->second;
+    DisarmIdleKeepAliveTimeout(&connection);
+    connection.header_timeout_armed = true;
+    ++connection.header_timeout_generation;
+    timer_heap_.push(TimerEntry {
+        now + kHeaderTimeout,
+        fd,
+        connection.connection_id,
+        connection.header_timeout_generation,
+        TimerKind::kHeader,
+    });
+}
+
+void Server::ArmIdleKeepAliveTimeout(int fd, std::chrono::steady_clock::time_point now) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end() || it->second.closing) {
+        return;
+    }
+
+    ClientConnection& connection = it->second;
+    DisarmHeaderTimeout(&connection);
+    connection.idle_timeout_armed = true;
+    ++connection.idle_timeout_generation;
+    timer_heap_.push(TimerEntry {
+        now + kIdleKeepAliveTimeout,
+        fd,
+        connection.connection_id,
+        connection.idle_timeout_generation,
+        TimerKind::kIdleKeepAlive,
+    });
+}
+
+void Server::DisarmHeaderTimeout(ClientConnection* connection) {
+    if (connection == nullptr) {
+        throw std::invalid_argument("connection must not be null");
+    }
+
+    if (!connection->header_timeout_armed) {
+        return;
+    }
+
+    connection->header_timeout_armed = false;
+    ++connection->header_timeout_generation;
+}
+
+void Server::DisarmIdleKeepAliveTimeout(ClientConnection* connection) {
+    if (connection == nullptr) {
+        throw std::invalid_argument("connection must not be null");
+    }
+
+    if (!connection->idle_timeout_armed) {
+        return;
+    }
+
+    connection->idle_timeout_armed = false;
+    ++connection->idle_timeout_generation;
+}
+
+bool Server::ShouldKeepAlive(const http::HttpRequest& request) const {
+    const std::string* connection_header = request.FindHeader("connection");
+    const bool wants_close =
+        connection_header != nullptr &&
+        ContainsHeaderToken(*connection_header, "close");
+    const bool wants_keep_alive =
+        connection_header != nullptr &&
+        ContainsHeaderToken(*connection_header, "keep-alive");
+
+    // 当前还没有 body 状态机，所以只在请求体为空时保留 keep-alive，
+    // 避免未消费的 body 留在 socket 里污染后续请求边界。
+    const bool body_is_safely_empty =
+        !request.has_content_length() || request.content_length() == 0;
+    if (!body_is_safely_empty) {
+        return false;
+    }
+
+    if (request.version() == "HTTP/1.1") {
+        return !wants_close;
+    }
+
+    return wants_keep_alive;
 }
 
 // 当 inbuf/outbuf 消费、缩小或丢弃数据时，要把对应字节数同步从全局计数里扣掉。
@@ -650,7 +841,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
             }
 
             std::cout
-                << "[Week2 Day6] read "
+                << "[Week3 Day1] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
@@ -814,6 +1005,17 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
         return false;
     }
 
+    if (connection.output_buffer.empty() &&
+        !connection.close_after_write &&
+        !connection.ready_for_read) {
+        if (connection.input_buffer.empty()) {
+            ArmIdleKeepAliveTimeout(fd, std::chrono::steady_clock::now());
+        } else {
+            ArmHeaderTimeout(fd, std::chrono::steady_clock::now());
+        }
+        UpdateClientPollMask(fd);
+    }
+
     return true;
 }
 
@@ -825,7 +1027,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day6] parsed request from "
+        << "[Week3 Day1] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -857,8 +1059,16 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     }
 
     ClientConnection& connection = it->second;
-    const std::string response = http::BuildSimpleOkResponse(kStaticOkBody);
-    connection.close_after_write = true;
+    DisarmHeaderTimeout(&connection);
+    DisarmIdleKeepAliveTimeout(&connection);
+
+    const bool keep_alive = ShouldKeepAlive(request) && !connection.close_after_write;
+    connection.keep_alive_enabled = keep_alive;
+    if (!keep_alive) {
+        connection.close_after_write = true;
+    }
+
+    const std::string response = http::BuildSimpleOkResponse(kStaticOkBody, keep_alive);
 
     // 如果前面已经有响应没写完，后面的响应必须直接追加到 outbuf 末尾，
     // 否则会破坏响应顺序。
@@ -878,7 +1088,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
         }
         UpdateClientPollMask(fd);
         std::cout
-            << "[Week2 Day6] deferred 200 OK for "
+            << "[Week3 Day1] deferred 200 OK for "
             << connection.peer_endpoint
             << " because write budget is exhausted"
             << '\n';
@@ -898,9 +1108,10 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
 
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day6] sent full 200 OK to "
+            << "[Week3 Day1] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
+            << ", keep_alive=" << (keep_alive ? "true" : "false")
             << '\n';
         return;
     }
@@ -913,7 +1124,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day6] queued "
+        << "[Week3 Day1] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
@@ -955,13 +1166,16 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
                 return;
             }
 
+            if (connection.keep_alive_enabled) {
+                ArmIdleKeepAliveTimeout(fd, std::chrono::steady_clock::now());
+            }
             UpdateClientPollMask(fd);
             return;
         }
 
         if (budget->write_remaining == 0) {
             std::cout
-                << "[Week2 Day6] paused writing to "
+                << "[Week3 Day1] paused writing to "
                 << connection.peer_endpoint
                 << " because write budget is exhausted"
                 << '\n';
@@ -989,7 +1203,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
         connection.output_buffer.erase(0, written);
         ReleaseInflightBytes(written);
         std::cout
-            << "[Week2 Day6] flushed "
+            << "[Week3 Day1] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
@@ -1033,7 +1247,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day6] sent error response "
+        << "[Week3 Day1] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -1062,7 +1276,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         return;
     }
 
-    // [Week2 Day6] New:
+    // [Week3 Day1] New:
     // active_connection_count_ 的递减放在“首次进入关闭流程”的这一刻。
     // 这样做的原因是：
     // 1. 文档要求 closing=true 成为活跃连接计数递减的唯一时机
@@ -1080,7 +1294,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     const std::string peer_endpoint = it->second.peer_endpoint;
 
     std::cout
-        << "[Week2 Day6] closing client "
+        << "[Week3 Day1] closing client "
         << peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
@@ -1092,6 +1306,9 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         poller_.Remove(fd);
         it->second.socket.reset();
     }
+
+    DisarmHeaderTimeout(&it->second);
+    DisarmIdleKeepAliveTimeout(&it->second);
 
     // 连接关闭时，要把这个连接仍然占着的 inbuf/outbuf 字节全部归还给全局预算。
     // 这里先释放计数，再清空缓冲区内容，避免 pending_close_queue 暂存对象时继续携带旧 buffer 大小。

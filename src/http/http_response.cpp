@@ -4,10 +4,10 @@
 
 namespace http {
 
-std::string BuildSimpleOkResponse(std::string_view body) {
+std::string BuildSimpleOkResponse(std::string_view body, bool keep_alive) {
     std::ostringstream oss;
     oss << "HTTP/1.1 200 OK\r\n";
-    oss << "Connection: close\r\n";
+    oss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
     oss << "Content-Type: text/plain\r\n";
     oss << "Content-Length: " << body.size() << "\r\n";
     oss << "\r\n";

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <deque>
 #include <list>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -17,7 +18,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day6 为止，它的职责是：
+// 到 Week3 Day1 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -33,6 +34,7 @@ namespace core {
 // 13. 对 inbuf/outbuf 维护全局 inflight budget，并对过大 Content-Length 返回 413
 // 14. 在 accept 路径上增加按 IP 计数的 token bucket，限制瞬时接入速率
 // 15. 对全局活跃连接数做 max_conns 封顶，超限连接仍然走统一关闭流程
+// 16. 使用最小堆定时器，给连接挂载 header_timeout 和 idle_keepalive_timeout
 class Server {
 public:
     // 构造函数：
@@ -66,6 +68,25 @@ private:
         std::size_t write_remaining = 0;
     };
 
+    enum class TimerKind {
+        kHeader,
+        kIdleKeepAlive,
+    };
+
+    struct TimerEntry {
+        std::chrono::steady_clock::time_point deadline {};
+        int fd = -1;
+        std::uint64_t connection_id = 0;
+        std::uint64_t generation = 0;
+        TimerKind kind = TimerKind::kHeader;
+    };
+
+    struct TimerEntryLater {
+        bool operator()(const TimerEntry& left, const TimerEntry& right) const noexcept {
+            return left.deadline > right.deadline;
+        }
+    };
+
     // ClientConnection 保存一个客户端连接在当前阶段所需的最小状态。
     struct ClientConnection {
         // 客户端 socket fd，由 RAII 负责自动关闭。
@@ -78,9 +99,9 @@ private:
         // 输出缓冲区保存“一次 write() 没写完”的响应尾部。
         // 只有在非阻塞 write 遇到 EAGAIN 或只写出一部分数据时，才会把剩余字节放到这里。
         std::string output_buffer;
-        // 当前阶段正常响应仍然走 "Connection: close"。
-        // 但为了支持一条连接里连续处理多个已缓冲请求，
-        // 这里会等当前已经排队好的响应都写完之后再真正关闭连接。
+        // close_after_write=true 表示当前连接在把已经排队好的响应刷完后就应当关闭。
+        // Week3 Day1 起，只有“当前代码能安全处理的无 body 请求”才可能保留 keep-alive；
+        // 其它情况仍然会把这个标记置为 true。
         bool close_after_write = false;
         // 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
         bool in_ready_queue = false;
@@ -92,6 +113,18 @@ private:
         // closing=true 表示该连接已经进入唯一关闭流程。
         // 一旦置位，后续任何读写/回调都应该跳过，避免对“正在销毁”的连接继续操作。
         bool closing = false;
+        // connection_id_ 用来给每一条连接生命周期分配唯一编号。
+        // 定时器只会作用到“fd 和 connection_id 都匹配”的连接，避免 fd 被内核复用后误伤新连接。
+        std::uint64_t connection_id = 0;
+        // keep_alive_enabled=true 表示当前连接完成本次响应后不会立刻关闭，
+        // 可以继续等待下一条请求并接受 idle_keepalive_timeout 管理。
+        bool keep_alive_enabled = false;
+        // header_timeout_armed / idle_timeout_armed 表示当前是否真的挂着对应定时器。
+        // generation 每次 arm/disarm 都会递增，用来让旧的堆节点自动失效。
+        bool header_timeout_armed = false;
+        std::uint64_t header_timeout_generation = 0;
+        bool idle_timeout_armed = false;
+        std::uint64_t idle_timeout_generation = 0;
     };
 
     // PendingCloseEntry 保存一个已经完成“摘 epoll + 关 fd + 清映射”的连接对象。
@@ -121,6 +154,14 @@ private:
     void RegisterListenSocket();
     // 运行一轮 epoll 事件循环。
     void RunEventLoopOnce();
+    // [Week3 Day1] New:
+    // 处理最小堆里已经到期的超时任务。
+    // 当前阶段只实现两类超时：
+    // 1. header_timeout：连接建立后，必须在 10 秒内收齐完整请求头
+    // 2. idle_keepalive_timeout：keep-alive 空闲连接最多保留 60 秒
+    void ProcessExpiredTimers();
+    // 根据 ReadyQueue 和最早一个定时器的 deadline，计算本轮 epoll_wait 最多阻塞多久。
+    int ComputePollTimeoutMs() const;
     // 在本轮 EventLoop 末尾统一释放 pending_close_queue 中的连接对象。
     void FlushPendingCloseQueue();
     // 处理一轮 ReadyQueue。
@@ -149,7 +190,7 @@ private:
     std::size_t DrainAcceptQueue();
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
-    // [Week2 Day6] New:
+    // [Week3 Day1] Begin:
     // accept 成功并注册后，立刻检查当前活跃连接数是否已经超过上限。
     // 这里单独拆成函数，是为了把“连接数封顶”的逻辑和“普通注册流程”分开：
     // 1. RegisterAcceptedConnection() 只负责把连接纳入管理
@@ -159,6 +200,7 @@ private:
     // - true ：连接数量仍在允许范围内，这个连接可以继续正常服务
     // - false：连接已经因为超限被拒绝，并且走完了统一关闭流程
     bool EnforceConnectionLimitAfterRegister(int fd);
+    // [Week3 Day1] End
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd, EventBudget* budget);
     // 处理某个连接输入缓冲区里已经完整的请求头。
@@ -178,6 +220,22 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
+    // [Week3 Day1] New:
+    // 在连接开始等待请求头时挂载 header_timeout。
+    // 这个状态既覆盖“刚 accept 进来还没收到首包”，也覆盖“keep-alive 连接已经开始下一条请求头，但迟迟收不完整”。
+    void ArmHeaderTimeout(int fd, std::chrono::steady_clock::time_point now);
+    // 在连接进入 keep-alive 空闲态时挂载 idle_keepalive_timeout。
+    void ArmIdleKeepAliveTimeout(int fd, std::chrono::steady_clock::time_point now);
+    // 下面两个函数用于显式取消对应的超时任务。
+    // 它们不需要从堆里物理删除节点，只会通过 generation 让旧节点在弹出时自动失效。
+    void DisarmHeaderTimeout(ClientConnection* connection);
+    void DisarmIdleKeepAliveTimeout(ClientConnection* connection);
+    // 判断一个请求在当前阶段能否安全保留 keep-alive。
+    // 这里仍然遵守“只在现有结构上前进”的原则：
+    // - HTTP/1.1 默认 keep-alive，除非 Connection: close
+    // - HTTP/1.0 默认 close，只有显式 keep-alive 才保留
+    // - 由于 body 状态机还没实现，只有“没有 body 或 body 长度为 0”的请求才允许保留连接
+    bool ShouldKeepAlive(const http::HttpRequest& request) const;
     // 在向 inbuf/outbuf 追加数据前先做全局 inflight budget 检查。
     // 这一步只负责判定“能不能继续追加”，真正的计数递增只会发生在追加成功之后。
     bool TryReserveInflightBytes(int fd, std::size_t add_bytes, const char* reason);
@@ -231,9 +289,12 @@ private:
     std::deque<int> ready_queue_;
     // pending_close_queue 保存“本轮已关闭但尚未真正释放”的连接对象。
     std::vector<PendingCloseEntry> pending_close_queue_;
+    // timer_heap_ 是当前阶段的最小堆定时器。
+    // 它只保存最小必要信息，由 EventLoop 线程串行 push/pop。
+    std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryLater> timer_heap_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
-    // [Week2 Day6] New:
+    // [Week3 Day1] New:
     // active_connection_count_ 只统计“已经纳入 epoll 管理，且 closing=false”的连接数。
     // 它的口径和文档里的 max_conns 完全一致：
     // 1. accept 成功并完成注册时 +1
@@ -245,6 +306,8 @@ private:
     // conn_reject_total_ 统计“因为超过 max_conns 而被拒绝”的连接总数。
     // 当前阶段它主要用于日志和 review，Week3 再继续接到统一 metrics。
     std::size_t conn_reject_total_ = 0;
+    // next_connection_id_ 为每条连接生命周期分配一个单调递增编号。
+    std::uint64_t next_connection_id_ = 1;
     // 统计当前所有活跃连接 inbuf + outbuf 占用的总字节数。
     std::size_t global_inflight_bytes_ = 0;
     // ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
