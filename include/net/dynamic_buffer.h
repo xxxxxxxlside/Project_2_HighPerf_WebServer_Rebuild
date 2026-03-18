@@ -39,6 +39,11 @@ public:
     // 取出下一个完整请求头，并从缓冲区中删除它。
     // 返回值会包含结尾的 "\r\n\r\n"。
     std::string PopNextHeader();
+    // 从缓冲区头部消费指定字节数。
+    // 这个接口给 Week3 Day2 的 body 接收路径复用：
+    // header 已经解析完后，body 字节仍然会继续留在同一个 input buffer 里，
+    // 这里需要按“已经安全消费掉的 body 字节数”把前缀丢掉。
+    void ConsumePrefix(std::size_t size);
 
 private:
     // 真正保存未处理字节的底层容器。

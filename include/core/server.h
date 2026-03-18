@@ -18,7 +18,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week3 Day1 为止，它的职责是：
+// 到 Week3 Day2 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -34,7 +34,8 @@ namespace core {
 // 13. 对 inbuf/outbuf 维护全局 inflight budget，并对过大 Content-Length 返回 413
 // 14. 在 accept 路径上增加按 IP 计数的 token bucket，限制瞬时接入速率
 // 15. 对全局活跃连接数做 max_conns 封顶，超限连接仍然走统一关闭流程
-// 16. 使用最小堆定时器，给连接挂载 header_timeout 和 idle_keepalive_timeout
+// 16. 使用最小堆定时器，给连接挂载 header_timeout、body_timeout、idle_keepalive_timeout
+// 17. 在解析完 header 后，按 Content-Length 驱动最小 body 接收状态机，并给慢速 body 设置 deadline
 class Server {
 public:
     // 构造函数：
@@ -70,6 +71,7 @@ private:
 
     enum class TimerKind {
         kHeader,
+        kBody,
         kIdleKeepAlive,
     };
 
@@ -100,8 +102,7 @@ private:
         // 只有在非阻塞 write 遇到 EAGAIN 或只写出一部分数据时，才会把剩余字节放到这里。
         std::string output_buffer;
         // close_after_write=true 表示当前连接在把已经排队好的响应刷完后就应当关闭。
-        // Week3 Day1 起，只有“当前代码能安全处理的无 body 请求”才可能保留 keep-alive；
-        // 其它情况仍然会把这个标记置为 true。
+        // Week3 Day2 起，请求体已经能被最小状态机读完，因此 keep-alive 不再局限于“无 body 请求”。
         bool close_after_write = false;
         // 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
         bool in_ready_queue = false;
@@ -119,10 +120,22 @@ private:
         // keep_alive_enabled=true 表示当前连接完成本次响应后不会立刻关闭，
         // 可以继续等待下一条请求并接受 idle_keepalive_timeout 管理。
         bool keep_alive_enabled = false;
-        // header_timeout_armed / idle_timeout_armed 表示当前是否真的挂着对应定时器。
+        // waiting_for_request_body=true 表示：
+        // 1. 这个连接已经解析完一个合法 header
+        // 2. 但它声明的 body 还没有收满
+        // 3. 因此当前不能继续解析后续 header，必须先把这次 body 消费完
+        bool waiting_for_request_body = false;
+        // pending_request 保存“header 已合法解析，但 body 还没收完”的那条请求。
+        // body 收满之后，会基于这份请求对象继续走现有的 200 OK 响应流程。
+        http::HttpRequest pending_request;
+        std::size_t pending_body_bytes_total = 0;
+        std::size_t pending_body_bytes_remaining = 0;
+        // header_timeout_armed / body_timeout_armed / idle_timeout_armed 表示当前是否真的挂着对应定时器。
         // generation 每次 arm/disarm 都会递增，用来让旧的堆节点自动失效。
         bool header_timeout_armed = false;
         std::uint64_t header_timeout_generation = 0;
+        bool body_timeout_armed = false;
+        std::uint64_t body_timeout_generation = 0;
         bool idle_timeout_armed = false;
         std::uint64_t idle_timeout_generation = 0;
     };
@@ -154,11 +167,12 @@ private:
     void RegisterListenSocket();
     // 运行一轮 epoll 事件循环。
     void RunEventLoopOnce();
-    // [Week3 Day1] New:
+    // [Week3 Day2] New:
     // 处理最小堆里已经到期的超时任务。
-    // 当前阶段只实现两类超时：
+    // 当前阶段实现三类超时：
     // 1. header_timeout：连接建立后，必须在 10 秒内收齐完整请求头
-    // 2. idle_keepalive_timeout：keep-alive 空闲连接最多保留 60 秒
+    // 2. body_timeout：header 合法后，必须在 deadline 内收齐请求体
+    // 3. idle_keepalive_timeout：keep-alive 空闲连接最多保留 60 秒
     void ProcessExpiredTimers();
     // 根据 ReadyQueue 和最早一个定时器的 deadline，计算本轮 epoll_wait 最多阻塞多久。
     int ComputePollTimeoutMs() const;
@@ -190,7 +204,7 @@ private:
     std::size_t DrainAcceptQueue();
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
-    // [Week3 Day1] Begin:
+    // [Week3 Day2] Begin:
     // accept 成功并注册后，立刻检查当前活跃连接数是否已经超过上限。
     // 这里单独拆成函数，是为了把“连接数封顶”的逻辑和“普通注册流程”分开：
     // 1. RegisterAcceptedConnection() 只负责把连接纳入管理
@@ -200,9 +214,17 @@ private:
     // - true ：连接数量仍在允许范围内，这个连接可以继续正常服务
     // - false：连接已经因为超限被拒绝，并且走完了统一关闭流程
     bool EnforceConnectionLimitAfterRegister(int fd);
-    // [Week3 Day1] End
+    // [Week3 Day2] End
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd, EventBudget* budget);
+    // 当一个连接已经进入“等待 body 收齐”的阶段时，尽量多消费当前 input buffer 里的 body 字节。
+    // 返回 false 表示连接已经被关闭或本轮必须停止。
+    bool ConsumePendingRequestBody(int fd, EventBudget* budget);
+    // header 解析成功后，如果请求带有非零 Content-Length，就把连接切进 body 接收状态。
+    // 返回 false 表示切换状态或后续处理过程中连接已经关闭。
+    bool BeginRequestBodyReceive(int fd,
+                                 const http::HttpRequest& request,
+                                 EventBudget* budget);
     // 处理某个连接输入缓冲区里已经完整的请求头。
     // 返回值语义：
     // - true：当前轮还可以继续处理这个连接
@@ -220,21 +242,26 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
-    // [Week3 Day1] New:
+    // [Week3 Day2] New:
     // 在连接开始等待请求头时挂载 header_timeout。
     // 这个状态既覆盖“刚 accept 进来还没收到首包”，也覆盖“keep-alive 连接已经开始下一条请求头，但迟迟收不完整”。
     void ArmHeaderTimeout(int fd, std::chrono::steady_clock::time_point now);
+    // 在请求头已经收齐、并且开始等待 body 剩余字节时挂载 body_timeout。
+    // deadline 口径遵守文档：min(body_timeout, body_deadline)。
+    void ArmBodyTimeout(int fd,
+                        std::chrono::steady_clock::time_point now,
+                        std::size_t content_length);
     // 在连接进入 keep-alive 空闲态时挂载 idle_keepalive_timeout。
     void ArmIdleKeepAliveTimeout(int fd, std::chrono::steady_clock::time_point now);
     // 下面两个函数用于显式取消对应的超时任务。
     // 它们不需要从堆里物理删除节点，只会通过 generation 让旧节点在弹出时自动失效。
     void DisarmHeaderTimeout(ClientConnection* connection);
+    void DisarmBodyTimeout(ClientConnection* connection);
     void DisarmIdleKeepAliveTimeout(ClientConnection* connection);
     // 判断一个请求在当前阶段能否安全保留 keep-alive。
-    // 这里仍然遵守“只在现有结构上前进”的原则：
+    // 这里继续遵守现有结构，不引入新的路由或业务逻辑，只根据协议语义决定是否允许复用连接：
     // - HTTP/1.1 默认 keep-alive，除非 Connection: close
     // - HTTP/1.0 默认 close，只有显式 keep-alive 才保留
-    // - 由于 body 状态机还没实现，只有“没有 body 或 body 长度为 0”的请求才允许保留连接
     bool ShouldKeepAlive(const http::HttpRequest& request) const;
     // 在向 inbuf/outbuf 追加数据前先做全局 inflight budget 检查。
     // 这一步只负责判定“能不能继续追加”，真正的计数递增只会发生在追加成功之后。
@@ -294,7 +321,7 @@ private:
     std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryLater> timer_heap_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
-    // [Week3 Day1] New:
+    // [Week3 Day2] New:
     // active_connection_count_ 只统计“已经纳入 epoll 管理，且 closing=false”的连接数。
     // 它的口径和文档里的 max_conns 完全一致：
     // 1. accept 成功并完成注册时 +1

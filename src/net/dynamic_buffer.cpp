@@ -66,4 +66,12 @@ std::string DynamicBuffer::PopNextHeader() {
     return header;
 }
 
+void DynamicBuffer::ConsumePrefix(std::size_t size) {
+    if (size > storage_.size()) {
+        throw std::out_of_range("cannot consume more bytes than buffer currently stores");
+    }
+
+    storage_.erase(0, size);
+}
+
 }  // namespace net
