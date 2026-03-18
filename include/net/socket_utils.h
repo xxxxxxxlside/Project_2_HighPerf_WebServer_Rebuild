@@ -39,10 +39,32 @@ private:
     int fd_ = -1;
 };
 
+// Day2 开始需要把监听 socket 和新接入的连接 socket 设为非阻塞。
+// 非阻塞的意义是：
+// 当当前没有数据或没有新连接时，系统调用不会把线程卡死，而是立刻返回。
+void SetNonBlocking(int fd);
+
 // Day1 使用的最小监听闭环：socket -> SO_REUSEADDR -> bind -> listen。
 UniqueFd CreateListenSocket(const std::string& host,
                             std::uint16_t port,
                             int backlog);
+
+// 保存一次 accept 成功后拿到的结果。
+// Day2 当前只需要知道：
+// 1. 新连接的 fd
+// 2. 对端地址字符串，便于日志输出和 review
+struct AcceptedSocket {
+    UniqueFd fd;
+    std::string peer_endpoint;
+};
+
+// 尝试从监听 socket 上 accept 一个新连接。
+// 返回值语义：
+// - true  ：本次成功接到一个连接，结果写入 accepted。
+// - false ：当前已经没有可接收的新连接了，通常表示遇到了 EAGAIN/EWOULDBLOCK。
+//
+// Day2 这里会把新连接直接设置为非阻塞，方便 Day3 以后继续往下接 epoll。
+bool TryAcceptOne(int listen_fd, AcceptedSocket* accepted);
 
 // 生成 "host:port" 形式的可读字符串，便于日志输出。
 std::string DescribeEndpoint(const std::string& host, std::uint16_t port);

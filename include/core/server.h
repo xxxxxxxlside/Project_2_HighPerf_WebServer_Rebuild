@@ -32,6 +32,14 @@ public:
     [[nodiscard]] int listening_fd() const noexcept;
 
 private:
+    // 把监听 socket 设置为非阻塞。
+    // 这是 Week1 Day2 的关键步骤之一。
+    void MakeListenSocketNonBlocking() const;
+
+    // 循环 accept 新连接，直到当前没有更多连接可接。
+    // 返回本轮成功接收的连接数量，便于日志统计。
+    std::size_t DrainAcceptQueue() const;
+
     std::string host_;
     std::uint16_t port_;
     int backlog_;

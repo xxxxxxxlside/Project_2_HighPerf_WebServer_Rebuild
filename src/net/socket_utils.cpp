@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -35,6 +36,19 @@ sockaddr_in BuildSockAddr(const std::string& host, std::uint16_t port) {
     }
 
     return addr;
+}
+
+// 把 accept 拿到的对端地址格式化成 "ip:port"。
+// 这个字符串只用于日志和调试，不参与任何业务逻辑。
+std::string DescribePeerEndpoint(const sockaddr_in& addr) {
+    char ip_buffer[INET_ADDRSTRLEN] = {0};
+    if (::inet_ntop(AF_INET, &addr.sin_addr, ip_buffer, sizeof(ip_buffer)) == nullptr) {
+        throw std::system_error(errno, std::generic_category(), "inet_ntop() failed");
+    }
+
+    std::ostringstream oss;
+    oss << ip_buffer << ':' << ntohs(addr.sin_port);
+    return oss.str();
 }
 
 }  // namespace
@@ -99,6 +113,20 @@ void UniqueFd::reset(int fd) noexcept {
     fd_ = fd;
 }
 
+// 把一个已存在的 fd 切换成非阻塞模式。
+// 之后像 accept/read/write 这类调用在“暂时做不了”时会返回 EAGAIN，
+// 而不是把整个线程卡在系统调用里。
+void SetNonBlocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        ThrowLastSystemError("fcntl(F_GETFL) failed");
+    }
+
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        ThrowLastSystemError("fcntl(F_SETFL, O_NONBLOCK) failed");
+    }
+}
+
 // 这是 Day1 最核心的工具函数。
 // 它会一次性完成：
 // 1. socket()
@@ -134,6 +162,38 @@ UniqueFd CreateListenSocket(const std::string& host,
     }
 
     return listen_fd;
+}
+
+// Day2 的 accept 工具函数。
+// 它每次只尝试接收一个连接，外层会在 Server 里循环调用它，
+// 直到它返回 false，表示当前已经没有更多连接可接了。
+bool TryAcceptOne(int listen_fd, AcceptedSocket* accepted) {
+    if (accepted == nullptr) {
+        throw std::invalid_argument("accepted must not be null");
+    }
+
+    sockaddr_in peer_addr {};
+    socklen_t peer_addr_len = sizeof(peer_addr);
+
+    // 这里使用 accept4，并直接给新连接加上 NONBLOCK 和 CLOEXEC。
+    // 这样新连接从一开始就是非阻塞的，也避免 fd 在 exec 时被子进程继承。
+    const int client_fd = ::accept4(listen_fd,
+                                    reinterpret_cast<sockaddr*>(&peer_addr),
+                                    &peer_addr_len,
+                                    SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (client_fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false;
+        }
+        if (errno == EINTR) {
+            return false;
+        }
+        ThrowLastSystemError("accept4() failed");
+    }
+
+    accepted->fd.reset(client_fd);
+    accepted->peer_endpoint = DescribePeerEndpoint(peer_addr);
+    return true;
 }
 
 // 把 host 和 port 拼成 "host:port" 字符串。
