@@ -5,6 +5,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "http/http_parser.h"
 #include "net/dynamic_buffer.h"
@@ -14,7 +15,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week2 Day2 为止，它的职责是：
+// 到 Week2 Day3 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -26,6 +27,7 @@ namespace core {
 // 9. 当一次 write() 写不完时，把剩余数据放进 outbuf，等待后续 EPOLLOUT 继续发送
 // 10. 使用 ReadyQueue 继续处理“用户态 buffer 里已经有完整请求，但本轮达到处理上限”的连接
 // 11. 对单连接单轮读/写量加预算，避免一个连接长时间独占 EventLoop
+// 12. 使用唯一关闭入口和 pending_close_queue，避免关闭过程中的 UAF 风险
 class Server {
 public:
     // 构造函数：
@@ -75,13 +77,22 @@ private:
         // 但为了支持一条连接里连续处理多个已缓冲请求，
         // 这里会等当前已经排队好的响应都写完之后再真正关闭连接。
         bool close_after_write = false;
-        // [Week2 Day2] New: 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
+        // 标记该连接是否已经在 ReadyQueue 中，避免重复入队。
         bool in_ready_queue = false;
-        // [Week2 Day2] New: 标记这个连接是否因为“读预算耗尽”而需要在 ReadyQueue 中继续读。
+        // 标记这个连接是否因为“读预算耗尽”而需要在 ReadyQueue 中继续读。
         // 这个标记的存在，是为了区分两种 ReadyQueue 来源：
         // 1. buffer 里还有完整请求，需要继续 parse/process
         // 2. 还没读到完整请求，但这一轮的 read 预算已经用完，需要下一轮继续 read
         bool ready_for_read = false;
+        // [Week2 Day3] New: closing=true 表示该连接已经进入唯一关闭流程。
+        // 一旦置位，后续任何读写/回调都应该跳过，避免对“正在销毁”的连接继续操作。
+        bool closing = false;
+    };
+
+    // PendingCloseEntry 保存一个已经完成“摘 epoll + 关 fd + 清映射”的连接对象。
+    // 这些对象不会立刻析构，而是在本轮 EventLoop 末尾统一释放。
+    struct PendingCloseEntry {
+        ClientConnection connection;
     };
 
     // 把监听 socket 设置为非阻塞。
@@ -92,6 +103,8 @@ private:
     void RegisterListenSocket();
     // 运行一轮 epoll 事件循环。
     void RunEventLoopOnce();
+    // 在本轮 EventLoop 末尾统一释放 pending_close_queue 中的连接对象。
+    void FlushPendingCloseQueue();
     // 处理一轮 ReadyQueue。
     // ReadyQueue 用来承接“用户态 buffer 中已有完整请求，但本轮不再继续处理”的连接。
     void ProcessReadyQueue();
@@ -107,7 +120,7 @@ private:
     // 对监听 socket 来说，“可读”意味着有新连接可以 accept。
     void HandleListenEvent(std::uint32_t events);
     // 处理客户端连接上的事件。
-    // 到 Week2 Day1 为止，这里主要区分三类情况：
+    // 到 Week2 Day3 为止，这里主要区分三类情况：
     // 1. 对端关闭 / 错误
     // 2. 可读事件：继续收 header 并解析
     // 3. 可写事件：继续把 outbuf 中没写完的响应刷出去
@@ -133,7 +146,7 @@ private:
     void StartOkResponse(int fd, const http::HttpRequest& request, EventBudget* budget);
     // 继续把 outbuf 里还没发完的数据刷到 socket。
     void FlushClientOutput(int fd, EventBudget* budget);
-    // [Week2 Day2] New: 把一个连接加入 ReadyQueue，等待后续轮次继续处理。
+    // 把一个连接加入 ReadyQueue，等待后续轮次继续处理。
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
@@ -142,7 +155,14 @@ private:
                                    int status_code,
                                    const char* reason_phrase,
                                    const char* close_reason);
-    // 关闭并移除一个客户端连接。
+    // [Week2 Day3] New: 连接关闭的唯一入口。
+    // 调用它时会统一完成：
+    // 1. 置 closing=true
+    // 2. 从 ReadyQueue 摘除
+    // 3. epoll_ctl(DEL)
+    // 4. close(fd)
+    // 5. 清理 fd -> connection 映射
+    // 6. 把对象放进 pending_close_queue，等待本轮末尾再真正释放
     void CloseClientConnection(int fd, const char* reason);
 
     std::string host_;
@@ -154,9 +174,11 @@ private:
     // epoll 封装对象。当前管理监听 fd 和客户端 fd。
     net::EpollPoller poller_;
 
-    // [Week2 Day2] New: ReadyQueue 保存“本轮不能继续处理，但后续轮次还必须继续”的连接 fd。
+    // ReadyQueue 保存“本轮不能继续处理，但后续轮次还必须继续”的连接 fd。
     // 这些连接必须在后续轮次继续处理，不能依赖下一次 EPOLLIN。
     std::deque<int> ready_queue_;
+    // [Week2 Day3] New: pending_close_queue 保存“本轮已关闭但尚未真正释放”的连接对象。
+    std::vector<PendingCloseEntry> pending_close_queue_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
 

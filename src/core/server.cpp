@@ -32,7 +32,7 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // Day6 先不引入真正的路由系统，先用一个静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week2 Day2 static response\n";
+constexpr std::string_view kStaticOkBody = "Week2 Day3 static response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -50,7 +50,7 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week2 Day2 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week2 Day3 为止，这里仍然只做监听相关和事件循环相关的初始化。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
@@ -65,7 +65,7 @@ void Server::Run() {
     }
 
     std::cout
-        << "[Week2 Day2] listening on "
+        << "[Week2 Day3] listening on "
         << net::DescribeEndpoint(host_, port_)
         << ", backlog=" << backlog_
         << ", non-blocking=true"
@@ -104,9 +104,37 @@ void Server::RunEventLoopOnce() {
     for (const net::PollEvent& event : events) {
         HandlePollEvent(event);
     }
+
+    FlushPendingCloseQueue();
 }
 
-// [Week2 Day2] Begin: ReadyQueue 现在同时承接“请求处理上限”和“读预算耗尽”两种续处理场景。
+// [Week2 Day3] Begin: pending_close_queue 负责把“关闭”和“释放”拆到同一轮的两个时点。
+
+// 在本轮 EventLoop 末尾统一释放 pending_close_queue 中保存的连接对象。
+// 这些对象在进入队列前，已经完成：
+// 1. closing=true
+// 2. 从 epoll 和 ReadyQueue 摘除
+// 3. close(fd)
+// 4. 从 clients_ 映射中删除
+//
+// 因此这里的职责很单纯：只负责真正释放对象内存。
+void Server::FlushPendingCloseQueue() {
+    if (pending_close_queue_.empty()) {
+        return;
+    }
+
+    std::cout
+        << "[Week2 Day3] releasing "
+        << pending_close_queue_.size()
+        << " connection object(s) from pending_close_queue"
+        << '\n';
+
+    pending_close_queue_.clear();
+}
+
+// [Week2 Day3] End
+
+// [Week2 Day3] Begin: ReadyQueue 续处理逻辑要与 closing 状态配合，避免继续操作待销毁连接。
 
 // 处理一轮 ReadyQueue。
 // 这里故意只处理“本轮开始时队列中已有的元素”，不把新入队的连接继续在同一轮吃完，
@@ -118,7 +146,7 @@ void Server::ProcessReadyQueue() {
         ready_queue_.pop_front();
 
         auto it = clients_.find(fd);
-        if (it == clients_.end()) {
+        if (it == clients_.end() || it->second.closing) {
             continue;
         }
 
@@ -135,7 +163,7 @@ void Server::ProcessReadyQueue() {
 // 3. 最后读：如果上轮是因为读预算耗尽才停下，就继续 read
 void Server::ContinueReadyConnection(int fd, EventBudget* budget) {
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -169,7 +197,7 @@ void Server::ContinueReadyConnection(int fd, EventBudget* budget) {
 // 加入条件只有一个：当前连接 buffer 中明明还有完整请求，但本轮不允许继续处理了。
 void Server::EnqueueReadyConnection(int fd, const char* reason) {
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -181,14 +209,14 @@ void Server::EnqueueReadyConnection(int fd, const char* reason) {
     ready_queue_.push_back(fd);
 
     std::cout
-        << "[Week2 Day2] queued client "
+        << "[Week2 Day3] queued client "
         << it->second.peer_endpoint
         << " into ReadyQueue, reason=" << reason
         << ", buffered=" << it->second.input_buffer.size()
         << '\n';
 }
 
-// [Week2 Day2] End
+// [Week2 Day3] End
 
 // 统一分发一轮事件。
 void Server::HandlePollEvent(const net::PollEvent& event) {
@@ -197,9 +225,18 @@ void Server::HandlePollEvent(const net::PollEvent& event) {
         return;
     }
 
-    if (clients_.find(event.fd) != clients_.end()) {
-        HandleClientEvent(event.fd, event.events);
+    auto it = clients_.find(event.fd);
+    if (it == clients_.end()) {
+        return;
     }
+
+    // closing=true 的连接已经进入唯一关闭流程。
+    // 这时即使某些回调仍然拿到了旧 fd，也必须直接跳过，避免 UAF 或误处理。
+    if (it->second.closing) {
+        return;
+    }
+
+    HandleClientEvent(event.fd, event.events);
 }
 
 // 处理监听 fd 的事件。
@@ -211,7 +248,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
     const std::size_t accepted_count = DrainAcceptQueue();
     if (accepted_count > 0) {
         std::cout
-            << "[Week2 Day2] drained "
+            << "[Week2 Day3] drained "
             << accepted_count
             << " connection(s) from listen queue"
             << '\n';
@@ -219,7 +256,7 @@ void Server::HandleListenEvent(std::uint32_t events) {
 }
 
 // 处理客户端 fd 的事件。
-// 到 Week2 Day2 为止，连接可能同时出现：
+// 到 Week2 Day3 为止，连接可能同时出现：
 // 1. 读事件：继续接收请求头
 // 2. 写事件：把 outbuf 里未发完的响应继续写出去
 // 3. 关闭/错误事件：直接回收连接
@@ -230,7 +267,7 @@ void Server::HandleClientEvent(int fd, std::uint32_t events) {
     }
 
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -286,7 +323,7 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     clients_.emplace(client_fd, std::move(connection));
 
     std::cout
-        << "[Week2 Day2] registered client "
+        << "[Week2 Day3] registered client "
         << clients_.at(client_fd).peer_endpoint
         << ", fd=" << client_fd
         << '\n';
@@ -304,7 +341,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
 
     while (budget->read_remaining > 0) {
         auto it = clients_.find(fd);
-        if (it == clients_.end()) {
+        if (it == clients_.end() || it->second.closing) {
             return;
         }
 
@@ -316,7 +353,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
             connection.input_buffer.Append(buffer, static_cast<std::size_t>(bytes_read));
 
             std::cout
-                << "[Week2 Day2] read "
+                << "[Week2 Day3] read "
                 << bytes_read
                 << " byte(s) from "
                 << connection.peer_endpoint
@@ -366,7 +403,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
     }
 
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -393,7 +430,7 @@ bool Server::CheckHeaderLimit(int fd) {
     return false;
 }
 
-// [Week2 Day2] Begin: 在保留“5 个完整请求上限”的同时，引入单轮读预算控制。
+// [Week2 Day3] Begin: 请求处理路径要尊重 closing 状态，并把关闭统一交给唯一入口。
 
 // 只要输入缓冲区里已经有完整 header，就循环拿出来解析。
 // 和 Day6 最大的不同点是：这里不再“有多少处理多少”，而是给每轮增加上限。
@@ -407,7 +444,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 
     while (processed_requests < kMaxRequestsPerRound) {
         auto it = clients_.find(fd);
-        if (it == clients_.end()) {
+        if (it == clients_.end() || it->second.closing) {
             return false;
         }
 
@@ -452,7 +489,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
     }
 
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return false;
     }
 
@@ -472,7 +509,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
     return true;
 }
 
-// [Week2 Day2] End
+// [Week2 Day3] End
 
 // 把一条成功解析的请求摘要打印出来。
 // 这样 review 时可以直接看到：
@@ -482,7 +519,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
 // - 是否带了 Content-Length
 void Server::LogParsedRequest(const ClientConnection& connection, const http::HttpRequest& request) const {
     std::cout
-        << "[Week2 Day2] parsed request from "
+        << "[Week2 Day3] parsed request from "
         << connection.peer_endpoint
         << ": method=" << http::ToString(request.method())
         << ", uri=" << request.uri()
@@ -498,7 +535,7 @@ void Server::LogParsedRequest(const ClientConnection& connection, const http::Ht
     std::cout << '\n';
 }
 
-// [Week2 Day2] Begin: 响应写回链路增加单轮写预算，避免大 outbuf 长时间独占 EventLoop。
+// [Week2 Day3] Begin: 响应写回链路需要配合 closing 状态，避免对已进入关闭流程的连接继续写。
 
 // 对已经通过 Day5 解析与校验的请求，启动最小 200 OK 响应流程。
 // 处理顺序是：
@@ -511,7 +548,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     }
 
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -533,7 +570,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
         connection.output_buffer = response;
         UpdateClientPollMask(fd);
         std::cout
-            << "[Week2 Day2] deferred 200 OK for "
+            << "[Week2 Day3] deferred 200 OK for "
             << connection.peer_endpoint
             << " because write budget is exhausted"
             << '\n';
@@ -553,7 +590,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
 
     if (written >= response.size()) {
         std::cout
-            << "[Week2 Day2] sent full 200 OK to "
+            << "[Week2 Day3] sent full 200 OK to "
             << connection.peer_endpoint
             << ", method=" << http::ToString(request.method())
             << '\n';
@@ -564,7 +601,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
     UpdateClientPollMask(fd);
 
     std::cout
-        << "[Week2 Day2] queued "
+        << "[Week2 Day3] queued "
         << connection.output_buffer.size()
         << " response byte(s) in outbuf for "
         << connection.peer_endpoint
@@ -582,7 +619,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
     while (true) {
         auto it = clients_.find(fd);
-        if (it == clients_.end()) {
+        if (it == clients_.end() || it->second.closing) {
             return;
         }
 
@@ -611,7 +648,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 
         if (budget->write_remaining == 0) {
             std::cout
-                << "[Week2 Day2] paused writing to "
+                << "[Week2 Day3] paused writing to "
                 << connection.peer_endpoint
                 << " because write budget is exhausted"
                 << '\n';
@@ -638,7 +675,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
         budget->write_remaining -= written;
         connection.output_buffer.erase(0, written);
         std::cout
-            << "[Week2 Day2] flushed "
+            << "[Week2 Day3] flushed "
             << written
             << " byte(s) from outbuf to "
             << connection.peer_endpoint
@@ -651,7 +688,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
 // 根据当前连接是否存在待写数据，更新 epoll 监听掩码。
 void Server::UpdateClientPollMask(int fd) {
     auto it = clients_.find(fd);
-    if (it == clients_.end()) {
+    if (it == clients_.end() || it->second.closing) {
         return;
     }
 
@@ -663,9 +700,9 @@ void Server::UpdateClientPollMask(int fd) {
     poller_.Modify(fd, events);
 }
 
-// [Week2 Day2] End
+// [Week2 Day3] End
 
-// [Week2 Day2] Begin: 统一收口当前阶段的错误响应与关闭流程。
+// [Week2 Day3] Begin: 唯一关闭入口 + pending_close_queue 是这一阶段的核心生命周期约束。
 
 // 发送一个很小的错误响应，然后立即关闭连接。
 // 这里采用 best-effort：
@@ -686,7 +723,7 @@ void Server::SendErrorResponseAndClose(int fd,
 
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
-        << "[Week2 Day2] sent error response "
+        << "[Week2 Day3] sent error response "
         << status_code
         << ' ' << reason_phrase
         << " to " << it->second.peer_endpoint
@@ -696,30 +733,50 @@ void Server::SendErrorResponseAndClose(int fd,
     CloseClientConnection(fd, close_reason);
 }
 
-// [Week2 Day2] End
+// [Week2 Day3] End
 
 // 关闭并移除一个客户端连接。
-// 当前阶段还没有 Week2 后续要做的 pending_close_queue，所以这里直接收掉即可。
-// 但为了避免 ReadyQueue 里留下旧 fd，这里会把对应标记清掉。
+// 这是连接进入关闭流程的唯一入口。
+// 这一层必须统一完成：
+// 1. 置 closing=true
+// 2. 从 ReadyQueue 摘除
+// 3. epoll_ctl(DEL)
+// 4. close(fd)
+// 5. 清理 fd -> connection 映射
+// 6. 入 pending_close_queue，等本轮末尾再释放对象
 void Server::CloseClientConnection(int fd, const char* reason) {
     auto it = clients_.find(fd);
     if (it == clients_.end()) {
         return;
     }
 
+    if (it->second.closing) {
+        return;
+    }
+
+    it->second.closing = true;
     it->second.in_ready_queue = false;
     it->second.ready_for_read = false;
     ready_queue_.erase(std::remove(ready_queue_.begin(), ready_queue_.end(), fd), ready_queue_.end());
 
+    const std::string peer_endpoint = it->second.peer_endpoint;
+
     std::cout
-        << "[Week2 Day2] closing client "
-        << it->second.peer_endpoint
+        << "[Week2 Day3] closing client "
+        << peer_endpoint
         << ", fd=" << fd
         << ", reason=" << reason
         << '\n';
 
-    poller_.Remove(fd);
+    if (it->second.socket.valid()) {
+        poller_.Remove(fd);
+        it->second.socket.reset();
+    }
+
+    PendingCloseEntry entry;
+    entry.connection = std::move(it->second);
     clients_.erase(it);
+    pending_close_queue_.push_back(std::move(entry));
 }
 
 // 这个函数只是把内部保存的监听 fd 暴露出来。
