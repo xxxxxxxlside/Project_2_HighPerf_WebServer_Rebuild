@@ -220,7 +220,6 @@ def main() -> int:
     lock = threading.Lock()
     worker_errors: list[BaseException] = []
 
-    # [Week3 Day4] Begin:
     # Day4 的目标不是做 wrk，而是在 sanitizer 口径下持续重放当前已经存在的核心路径：
     # 1. keep-alive GET
     # 2. 带 body 的 POST
@@ -298,8 +297,6 @@ def main() -> int:
         server_log.flush()
         server_log.seek(0)
         server_output = server_log.read()
-    # [Week3 Day4] End
-
     if server_process.returncode != 0:
         raise RuntimeError(f"server exited with code {server_process.returncode}\n{server_output}")
 

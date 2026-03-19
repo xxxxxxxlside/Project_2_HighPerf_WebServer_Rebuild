@@ -28,7 +28,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 endif()
 
-# [Week3 Day4] Begin:
 # Day4 只补 asan_ubsan 口径，不提前接 tsan 或 wrk。
 # 这里把构建口径直接固化到 CMake 的一个独立 build type 里，方便后续统一复用。
 if(CMAKE_BUILD_TYPE STREQUAL "ASanUBSan")
@@ -51,6 +50,5 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
 endif()
-# [Week3 Day4] End
 
 add_subdirectory(src)
