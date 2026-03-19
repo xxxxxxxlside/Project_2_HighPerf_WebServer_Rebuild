@@ -14,7 +14,7 @@
 
 ## 当前进度
 
-当前真实进度是 **Week3 Day5**。
+当前真实进度是 **Week3 Day6**，并且 **Project2 MVP 已完成**。
 
 已完成：
 
@@ -25,6 +25,7 @@
 - Week3 Day3：接入统一 metrics 原子计数器，并每秒写一行 `metrics.log`，输出 `uptime_s / rss_kb / accept_total / requests_total / reject_total / global_inflight_bytes_current` 等字段。
 - Week3 Day4：补齐 `ASanUBSan` 构建口径、`ctest` 自测入口和核心 sanitizer smoke 脚本，用现有 GET / POST / 411 / metrics 路径做内存安全回归。
 - Week3 Day5：新增 `wrk` 标准化压测脚本，按 `warmup=5s + measurement=30s` 从 `metrics.log` 做 `requests_total / accept_total` 差分统计，并校验复用率阈值。
+- Week3 Day6：补齐 3 轮有效压测补跑、中位数选择和证据目录落盘，完成 `results/webserver/<yyyymmdd_machine>/` 下的 MVP 验收材料。
 
 ## 当前能力
 
@@ -53,18 +54,24 @@
   - 提供 `scripts/run_wrk_benchmark.sh`，默认按 Release 构建并调用 `wrk -t8 -c100 -d35s --latency`。
   - 压测脚本会从 `metrics.log` 读取 warmup 结束和测量结束采样点，计算 `accept_total` 与 `requests_total` 差分。
   - 当前会直接给出单轮 `reuse_ratio = requests_delta / accept_delta` 的验收结果；若 `accept_delta == 0` 则判定该轮无效。
+- Week3 Day6 MVP 收尾：
+  - 提供 `scripts/run_mvp_acceptance.sh`，自动跑 Release 构建、补齐 3 轮有效 benchmark，并生成证据目录。
+  - 会落盘 `machine.txt`、`build_flags.txt`、`bench_cmd.txt`、`latency_samples.txt`、`summary.md`。
+  - `summary.md` 会按 3 轮有效结果的 `qps` 中位数选出中位轮，并继续检查 `reuse_ratio > 10`。
 
 ## 当前边界
 
-本版本仍然**没有**实现下面这些内容：
+当前 Project2 已达到 docs 里的 **MVP 封板** 状态。
 
-- Week3 Day6 之后的三轮中位数统计和证据目录落盘。
-- 更长时间的 `asan_ubsan >= 5min` 自动化回归编排与结果归档。
+本仓库目前仍然**没有**实现下面这些内容：
+
+- Pro 阶段的时间轮、`sendfile` / `writev` 等进一步性能优化。
+- 更长时间的 `asan_ubsan >= 5min` 自动化回归编排与更完整的压测归档体系。
 
 因此当前实现仍然保持“最小可用”边界：
 
 - body 会被按 `Content-Length` 收满，但不会进入更复杂的业务处理或路由层。
-- Week3 Day5 只补单轮 wrk 压测脚本与复用率校验，不提前做 Day6 的多轮统计和证据归档。
+- 当前版本以 Project2 MVP 完成为边界，不继续扩展到 Pro。
 
 ## 构建与运行
 
@@ -94,9 +101,7 @@ cmake --build build -j
 ./scripts/run_demo.sh --port 8080
 ```
 
-## 下一步
+## 当前结论
 
-如果继续按计划推进，下一阶段应该只做 **Week3 Day6**：
-
-- 跑 3 轮压测并取中位数。
-- 开始把 `machine.txt / build_flags.txt / bench_cmd.txt / summary.md` 等证据按目录落盘。
+- Project2 MVP 已完成：单 Reactor 单 EventLoop、协议边界防御、定时器、metrics、sanitizer 自测、单轮 wrk 验收脚本、3 轮有效 benchmark 与证据目录落盘都已经具备。
+- 如果后续继续推进，应当明确切换到 docs 中的 Pro 范围，而不是继续往 MVP 里追加功能。

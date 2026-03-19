@@ -11,12 +11,7 @@ docs/
 *.out
 *.log
 
-results/*/metrics.log
-results/*/machine.txt
-results/*/build_flags.txt
-results/*/bench_cmd.txt
-results/*/latency_samples.txt
-results/*/summary.md
+results/webserver/
 
 .vscode/
 .idea/

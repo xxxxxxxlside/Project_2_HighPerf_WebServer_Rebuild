@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+from dataclasses import dataclass
+import os
 import pathlib
 import signal
 import socket
@@ -8,6 +10,24 @@ import subprocess
 import sys
 import tempfile
 import time
+
+
+@dataclass
+class BenchmarkRunResult:
+    wrk_command: list[str]
+    wrk_stdout: str
+    wrk_stderr: str
+    metrics_log_path: pathlib.Path
+    warmup_sample_ts_ms: int
+    end_sample_ts_ms: int
+    accept_delta: int
+    requests_delta: int
+    reject_delta: int
+    errors_delta: int
+    reuse_ratio: float | None
+    qps: float
+    rss_delta_kb: int
+    cpu_pct: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,8 +121,16 @@ def format_wrk_url(host: str, port: int, path: str) -> str:
     return f"http://{host}:{port}{normalized_path}"
 
 
-def main() -> int:
-    args = parse_args()
+def read_process_cpu_total_seconds(pid: int) -> float:
+    stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    stat_tail = stat_text.split(") ", 1)[1].split()
+    utime_ticks = int(stat_tail[11])
+    stime_ticks = int(stat_tail[12])
+    clock_ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    return (utime_ticks + stime_ticks) / clock_ticks_per_second
+
+
+def run_benchmark_once(args: argparse.Namespace) -> BenchmarkRunResult:
     project_root = pathlib.Path(__file__).resolve().parent.parent
     server_path = pathlib.Path(args.server_path).resolve()
     if not server_path.exists():
@@ -114,7 +142,6 @@ def main() -> int:
     total_duration_sec = args.warmup_sec + args.measure_sec
     wrk_url = format_wrk_url(args.host, args.port, args.path)
 
-    # [Week3 Day5] Begin:
     # Day5 的目标是把 wrk 压测口径和 metrics 差分统计固化成一条脚本：
     # 1. 用 wrk 按固定参数发起 keep-alive 压测
     # 2. 从 metrics.log 里取 warmup 结束和测量结束两个采样点
@@ -154,12 +181,12 @@ def main() -> int:
             ]
 
             try:
-                wrk_result = subprocess.run(
+                wrk_process = subprocess.Popen(
                     wrk_command,
                     cwd=project_root,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    check=False,
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError(
@@ -167,11 +194,18 @@ def main() -> int:
                     "Install wrk or pass --wrk-binary <path>."
                 ) from exc
 
-            if wrk_result.returncode != 0:
+            time.sleep(args.warmup_sec)
+            cpu_start_seconds = read_process_cpu_total_seconds(server_process.pid)
+            cpu_wall_start = time.monotonic()
+            wrk_stdout, wrk_stderr = wrk_process.communicate()
+            cpu_wall_seconds = time.monotonic() - cpu_wall_start
+            cpu_end_seconds = read_process_cpu_total_seconds(server_process.pid)
+
+            if wrk_process.returncode != 0:
                 raise RuntimeError(
-                    f"wrk failed with code {wrk_result.returncode}\n"
-                    f"stdout:\n{wrk_result.stdout}\n"
-                    f"stderr:\n{wrk_result.stderr}"
+                    f"wrk failed with code {wrk_process.returncode}\n"
+                    f"stdout:\n{wrk_stdout}\n"
+                    f"stderr:\n{wrk_stderr}"
                 )
 
             samples = wait_for_metrics_sample(metrics_log_path, end_boundary_ms, timeout_sec=5.0)
@@ -188,7 +222,6 @@ def main() -> int:
         server_log.flush()
         server_log.seek(0)
         server_output = server_log.read()
-    # [Week3 Day5] End
 
     if server_process.returncode != 0:
         raise RuntimeError(f"server exited with code {server_process.returncode}\n{server_output}")
@@ -197,33 +230,62 @@ def main() -> int:
     requests_delta = end_sample["requests_total"] - warmup_sample["requests_total"]
     reject_delta = end_sample["reject_total"] - warmup_sample["reject_total"]
     errors_delta = end_sample["errors_total"] - warmup_sample["errors_total"]
+    measured_seconds = max(0.001, (end_sample["ts"] - warmup_sample["ts"]) / 1000.0)
+    reuse_ratio = None if accept_delta == 0 else requests_delta / accept_delta
+    qps = requests_delta / measured_seconds
+    rss_delta_kb = end_sample["rss_kb"] - warmup_sample["rss_kb"]
+    cpu_pct = ((cpu_end_seconds - cpu_start_seconds) / max(cpu_wall_seconds, 0.001)) * 100.0
+
+    return BenchmarkRunResult(
+        wrk_command=wrk_command,
+        wrk_stdout=wrk_stdout,
+        wrk_stderr=wrk_stderr,
+        metrics_log_path=metrics_log_path,
+        warmup_sample_ts_ms=warmup_sample["ts"],
+        end_sample_ts_ms=end_sample["ts"],
+        accept_delta=accept_delta,
+        requests_delta=requests_delta,
+        reject_delta=reject_delta,
+        errors_delta=errors_delta,
+        reuse_ratio=reuse_ratio,
+        qps=qps,
+        rss_delta_kb=rss_delta_kb,
+        cpu_pct=cpu_pct,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    result = run_benchmark_once(args)
 
     print("wrk stdout:")
-    print(wrk_result.stdout.rstrip())
-    if wrk_result.stderr.strip():
+    print(result.wrk_stdout.rstrip())
+    if result.wrk_stderr.strip():
         print("wrk stderr:")
-        print(wrk_result.stderr.rstrip())
+        print(result.wrk_stderr.rstrip())
 
     print("measurement summary:")
-    print(f"  warmup_sample_ts_ms={warmup_sample['ts']}")
-    print(f"  end_sample_ts_ms={end_sample['ts']}")
-    print(f"  accept_delta={accept_delta}")
-    print(f"  requests_delta={requests_delta}")
-    print(f"  reject_delta={reject_delta}")
-    print(f"  errors_delta={errors_delta}")
+    print(f"  warmup_sample_ts_ms={result.warmup_sample_ts_ms}")
+    print(f"  end_sample_ts_ms={result.end_sample_ts_ms}")
+    print(f"  accept_delta={result.accept_delta}")
+    print(f"  requests_delta={result.requests_delta}")
+    print(f"  reject_delta={result.reject_delta}")
+    print(f"  errors_delta={result.errors_delta}")
+    print(f"  qps={result.qps:.4f}")
+    print(f"  rss_delta_kb={result.rss_delta_kb}")
+    print(f"  cpu_pct={result.cpu_pct:.4f}")
 
-    if accept_delta == 0:
+    if result.accept_delta == 0 or result.reuse_ratio is None:
         raise RuntimeError(
             "benchmark run is invalid because accept_delta == 0 in the measurement window"
         )
 
-    reuse_ratio = requests_delta / accept_delta
-    print(f"  reuse_ratio={reuse_ratio:.4f}")
+    print(f"  reuse_ratio={result.reuse_ratio:.4f}")
     print(f"  reuse_threshold={args.reuse_threshold:.4f}")
 
-    if reuse_ratio <= args.reuse_threshold:
+    if result.reuse_ratio <= args.reuse_threshold:
         raise RuntimeError(
-            f"reuse ratio check failed: {reuse_ratio:.4f} <= {args.reuse_threshold:.4f}"
+            f"reuse ratio check failed: {result.reuse_ratio:.4f} <= {args.reuse_threshold:.4f}"
         )
 
     return 0
