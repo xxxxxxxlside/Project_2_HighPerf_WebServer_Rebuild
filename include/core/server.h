@@ -166,7 +166,6 @@ private:
     void MakeListenSocketNonBlocking() const;
     // 创建并初始化 epoll。
     void InitializePoller();
-    // [Week3 Day3] New:
     // 初始化本轮运行的 metrics 输出目录和 metrics.log 文件。
     // Week3 Day3 只做“统一计数 + 每秒落盘”，不引入额外线程或更复杂的证据归档。
     void InitializeMetricsLogging();
@@ -174,7 +173,6 @@ private:
     void RegisterListenSocket();
     // 运行一轮 epoll 事件循环。
     void RunEventLoopOnce();
-    // [Week3 Day3] New:
     // 如果当前已经到达下一次落盘时刻，就把一行 metrics 写入 metrics.log。
     void MaybeWriteMetricsLog();
     // 读取当前进程 RSS（KB），来源固定为 /proc/self/status 的 VmRSS。
@@ -219,7 +217,6 @@ private:
     std::size_t DrainAcceptQueue();
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
-    // [Week3 Day3] Begin:
     // accept 成功并注册后，立刻检查当前活跃连接数是否已经超过上限。
     // 这里单独拆成函数，是为了把“连接数封顶”的逻辑和“普通注册流程”分开：
     // 1. RegisterAcceptedConnection() 只负责把连接纳入管理
@@ -229,7 +226,6 @@ private:
     // - true ：连接数量仍在允许范围内，这个连接可以继续正常服务
     // - false：连接已经因为超限被拒绝，并且走完了统一关闭流程
     bool EnforceConnectionLimitAfterRegister(int fd);
-    // [Week3 Day3] End
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd, EventBudget* budget);
     // 当一个连接已经进入“等待 body 收齐”的阶段时，尽量多消费当前 input buffer 里的 body 字节。
@@ -257,7 +253,6 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
-    // [Week3 Day3] New:
     // 在连接开始等待请求头时挂载 header_timeout。
     // 这个状态既覆盖“刚 accept 进来还没收到首包”，也覆盖“keep-alive 连接已经开始下一条请求头，但迟迟收不完整”。
     void ArmHeaderTimeout(int fd, std::chrono::steady_clock::time_point now);
@@ -336,7 +331,6 @@ private:
     std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryLater> timer_heap_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
-    // [Week3 Day3] New:
     // active_connection_count_ 只统计“已经纳入 epoll 管理，且 closing=false”的连接数。
     // 它的口径和文档里的 max_conns 完全一致：
     // 1. accept 成功并完成注册时 +1
@@ -355,7 +349,6 @@ private:
     // ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
     std::list<std::string> ip_bucket_lru_;
     std::unordered_map<std::string, IpTokenBucketEntry> ip_token_buckets_;
-    // [Week3 Day3] New:
     // metrics_start_time_ / next_metrics_log_time_ 只由 EventLoop 线程维护；
     // 对外可观察的数值则统一放进 atomic 里，方便后续压测或外部采样复用同一口径。
     std::chrono::steady_clock::time_point metrics_start_time_ {};

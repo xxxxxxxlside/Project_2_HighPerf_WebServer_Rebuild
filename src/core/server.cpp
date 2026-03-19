@@ -194,7 +194,6 @@ void Server::InitializePoller() {
 }
 
 void Server::InitializeMetricsLogging() {
-    // [Week3 Day3] Begin:
     // Week3 Day3 先把 metrics 落盘路径固定为 results/webserver/<date>_<machine>/metrics.log。
     // 这里还不做 Day6 的完整证据目录，只准备当前运行需要的 metrics.log。
     const std::filesystem::path metrics_dir =
@@ -209,7 +208,6 @@ void Server::InitializeMetricsLogging() {
 
     metrics_start_time_ = std::chrono::steady_clock::now();
     next_metrics_log_time_ = metrics_start_time_ + kMetricsLogInterval;
-    // [Week3 Day3] End
 }
 
 void Server::MaybeWriteMetricsLog() {
@@ -685,7 +683,6 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
         << ", active_connections=" << active_connection_count_
         << '\n';
 
-    // [Week3 Day3] Begin:
     // 连接已经纳入 epoll 和 clients_ 之后，立刻检查全局连接数上限。
     // 这里故意放在“注册之后”而不是“注册之前”，是为了严格遵守文档里的计数口径：
     // 1. accept 成功并纳入管理后，活跃连接数先 +1
@@ -696,10 +693,8 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     if (!EnforceConnectionLimitAfterRegister(client_fd)) {
         return;
     }
-    // [Week3 Day3] End
 }
 
-// [Week3 Day3] New:
 // 这个函数专门收口“accept 成功后发现总连接数超限”的分支。
 // 它不直接手写 close 逻辑，而是继续复用唯一关闭入口，原因有两个：
 // 1. 连接计数的递减口径已经写进关闭入口，避免一处忘减导致统计失真
@@ -1636,7 +1631,6 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         return;
     }
 
-    // [Week3 Day3] New:
     // active_connection_count_ 的递减放在“首次进入关闭流程”的这一刻。
     // 这样做的原因是：
     // 1. 文档要求 closing=true 成为活跃连接计数递减的唯一时机

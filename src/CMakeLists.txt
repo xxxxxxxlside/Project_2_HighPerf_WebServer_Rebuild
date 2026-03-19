@@ -40,3 +40,21 @@ target_link_libraries(webserver
 set_target_properties(webserver PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# [Week3 Day4] New:
+# Day4 的核心是给当前闭环补一条可重复执行的 sanitizer 自测入口。
+# 这里先用 Python 脚本启动服务、压一小段已有场景，并检查 metrics 是否仍然守恒。
+if(BUILD_TESTING)
+    add_test(
+        NAME webserver_sanitizer_smoke
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/scripts/sanitizer_smoke.py
+            --server-path $<TARGET_FILE:webserver>
+            --duration-sec 3
+    )
+    set_tests_properties(webserver_sanitizer_smoke PROPERTIES
+        TIMEOUT 30
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+endif()
