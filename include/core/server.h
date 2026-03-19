@@ -1,9 +1,11 @@
 ﻿#pragma once
 
+#include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <chrono>
 #include <deque>
+#include <fstream>
 #include <list>
 #include <queue>
 #include <string>
@@ -18,7 +20,7 @@
 namespace core {
 
 // Server 负责当前阶段的服务端主流程。
-// 到 Week3 Day2 为止，它的职责是：
+// 到 Week3 Day3 为止，它的职责是：
 // 1. 创建监听 socket
 // 2. 把监听 socket 切成非阻塞
 // 3. 创建 epoll 实例
@@ -36,6 +38,7 @@ namespace core {
 // 15. 对全局活跃连接数做 max_conns 封顶，超限连接仍然走统一关闭流程
 // 16. 使用最小堆定时器，给连接挂载 header_timeout、body_timeout、idle_keepalive_timeout
 // 17. 在解析完 header 后，按 Content-Length 驱动最小 body 接收状态机，并给慢速 body 设置 deadline
+// 18. 维护统一 metrics 计数器，并每秒落盘一行标准 metrics 日志
 class Server {
 public:
     // 构造函数：
@@ -163,11 +166,23 @@ private:
     void MakeListenSocketNonBlocking() const;
     // 创建并初始化 epoll。
     void InitializePoller();
+    // [Week3 Day3] New:
+    // 初始化本轮运行的 metrics 输出目录和 metrics.log 文件。
+    // Week3 Day3 只做“统一计数 + 每秒落盘”，不引入额外线程或更复杂的证据归档。
+    void InitializeMetricsLogging();
     // 把监听 fd 注册进 epoll，监听可读事件。
     void RegisterListenSocket();
     // 运行一轮 epoll 事件循环。
     void RunEventLoopOnce();
-    // [Week3 Day2] New:
+    // [Week3 Day3] New:
+    // 如果当前已经到达下一次落盘时刻，就把一行 metrics 写入 metrics.log。
+    void MaybeWriteMetricsLog();
+    // 读取当前进程 RSS（KB），来源固定为 /proc/self/status 的 VmRSS。
+    [[nodiscard]] std::uint64_t ReadCurrentRssKb() const;
+    // 把 reject 事件统一记到 metrics 中，并按常见状态码做 bucket 细分。
+    void RecordRejectMetric(int status_code);
+    // 把运行时错误路径统一记到 errors_total。
+    void RecordErrorMetric();
     // 处理最小堆里已经到期的超时任务。
     // 当前阶段实现三类超时：
     // 1. header_timeout：连接建立后，必须在 10 秒内收齐完整请求头
@@ -204,7 +219,7 @@ private:
     std::size_t DrainAcceptQueue();
     // 把一个新连接加入连接表并注册到 epoll。
     void RegisterAcceptedConnection(net::AcceptedSocket accepted);
-    // [Week3 Day2] Begin:
+    // [Week3 Day3] Begin:
     // accept 成功并注册后，立刻检查当前活跃连接数是否已经超过上限。
     // 这里单独拆成函数，是为了把“连接数封顶”的逻辑和“普通注册流程”分开：
     // 1. RegisterAcceptedConnection() 只负责把连接纳入管理
@@ -214,7 +229,7 @@ private:
     // - true ：连接数量仍在允许范围内，这个连接可以继续正常服务
     // - false：连接已经因为超限被拒绝，并且走完了统一关闭流程
     bool EnforceConnectionLimitAfterRegister(int fd);
-    // [Week3 Day2] End
+    // [Week3 Day3] End
     // 从一个客户端连接上循环读取数据，直到 EAGAIN 或连接关闭。
     void ReadFromClient(int fd, EventBudget* budget);
     // 当一个连接已经进入“等待 body 收齐”的阶段时，尽量多消费当前 input buffer 里的 body 字节。
@@ -242,7 +257,7 @@ private:
     void EnqueueReadyConnection(int fd, const char* reason);
     // 根据当前连接状态更新 epoll 监听掩码。
     void UpdateClientPollMask(int fd);
-    // [Week3 Day2] New:
+    // [Week3 Day3] New:
     // 在连接开始等待请求头时挂载 header_timeout。
     // 这个状态既覆盖“刚 accept 进来还没收到首包”，也覆盖“keep-alive 连接已经开始下一条请求头，但迟迟收不完整”。
     void ArmHeaderTimeout(int fd, std::chrono::steady_clock::time_point now);
@@ -321,7 +336,7 @@ private:
     std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryLater> timer_heap_;
     // 保存所有当前活跃的客户端连接。
     std::unordered_map<int, ClientConnection> clients_;
-    // [Week3 Day2] New:
+    // [Week3 Day3] New:
     // active_connection_count_ 只统计“已经纳入 epoll 管理，且 closing=false”的连接数。
     // 它的口径和文档里的 max_conns 完全一致：
     // 1. accept 成功并完成注册时 +1
@@ -331,7 +346,7 @@ private:
     // 后面做 review 或加 metrics 时更容易检查这条计数是不是守恒。
     std::size_t active_connection_count_ = 0;
     // conn_reject_total_ 统计“因为超过 max_conns 而被拒绝”的连接总数。
-    // 当前阶段它主要用于日志和 review，Week3 再继续接到统一 metrics。
+    // Week3 Day3 起，它会继续同步到 metrics 里的 conn_reject_total。
     std::size_t conn_reject_total_ = 0;
     // next_connection_id_ 为每条连接生命周期分配一个单调递增编号。
     std::uint64_t next_connection_id_ = 1;
@@ -340,6 +355,27 @@ private:
     // ip_bucket_lru_ + ip_token_buckets_ 共同维护“有界、可过期”的按 IP 限流状态。
     std::list<std::string> ip_bucket_lru_;
     std::unordered_map<std::string, IpTokenBucketEntry> ip_token_buckets_;
+    // [Week3 Day3] New:
+    // metrics_start_time_ / next_metrics_log_time_ 只由 EventLoop 线程维护；
+    // 对外可观察的数值则统一放进 atomic 里，方便后续压测或外部采样复用同一口径。
+    std::chrono::steady_clock::time_point metrics_start_time_ {};
+    std::chrono::steady_clock::time_point next_metrics_log_time_ {};
+    std::string metrics_log_path_;
+    std::ofstream metrics_log_stream_;
+    std::atomic<std::uint64_t> metrics_accept_total_ {0};
+    std::atomic<std::uint64_t> metrics_requests_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_total_ {0};
+    std::atomic<std::uint64_t> metrics_errors_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_411_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_413_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_429_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_431_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_501_total_ {0};
+    std::atomic<std::uint64_t> metrics_reject_503_total_ {0};
+    std::atomic<std::uint64_t> metrics_conn_reject_total_ {0};
+    std::atomic<std::uint64_t> metrics_timeout_close_total_ {0};
+    std::atomic<std::uint64_t> metrics_conns_current_ {0};
+    std::atomic<std::uint64_t> metrics_global_inflight_bytes_current_ {0};
 
     // Day5 引入的最小 HTTP 头解析器。
     http::HttpParser http_parser_;

@@ -3,9 +3,17 @@
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
+#include <ctime>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <string_view>
 #include <sys/epoll.h>
@@ -33,7 +41,7 @@ constexpr std::size_t kReadChunkSize = 4096;
 constexpr std::size_t kMaxHeaderBytes = 8192;
 
 // 当前阶段先继续用静态文本把正常响应链路走通。
-constexpr std::string_view kStaticOkBody = "Week3 Day2 static response\n";
+constexpr std::string_view kStaticOkBody = "RouteC MVP response\n";
 
 // Week2 Day1 要求单连接单轮最多只处理 5 个完整请求。
 // 这样做的目的是避免一个连接持续占用 EventLoop，导致其它连接饥饿。
@@ -67,6 +75,7 @@ constexpr std::size_t kMaxConnections = 200000;
 constexpr auto kHeaderTimeout = std::chrono::seconds(10);
 constexpr auto kBodyTimeout = std::chrono::seconds(120);
 constexpr auto kIdleKeepAliveTimeout = std::chrono::seconds(60);
+constexpr auto kMetricsLogInterval = std::chrono::seconds(1);
 
 // 当前工程到这里仍然只支持 IPv4，对端地址字符串始终是 "ip:port"。
 // 因此这里直接按最后一个 ':' 把 IP 部分切出来即可。
@@ -104,6 +113,38 @@ std::chrono::steady_clock::time_point CalculateBodyReceiveDeadline(
     return std::min(body_deadline, hard_timeout_deadline);
 }
 
+std::string SanitizeMachineName(std::string text) {
+    for (char& ch : text) {
+        const bool allowed =
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' ||
+            ch == '_';
+        if (!allowed) {
+            ch = '_';
+        }
+    }
+    return text;
+}
+
+std::string BuildMetricsRunDirectoryName() {
+    char hostname[256] = {};
+    std::string machine = "unknown";
+    if (::gethostname(hostname, sizeof(hostname) - 1) == 0 && hostname[0] != '\0') {
+        machine = hostname;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm {};
+    localtime_r(&now_time, &local_tm);
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_tm, "%Y%m%d") << '_' << SanitizeMachineName(machine);
+    return oss.str();
+}
+
 }  // namespace
 
 // 构造函数只保存配置，不做系统调用。
@@ -111,11 +152,12 @@ Server::Server(std::string host, std::uint16_t port, int backlog)
     : host_(std::move(host)), port_(port), backlog_(backlog) {}
 
 // Initialize() 负责完成服务启动前的准备工作。
-// 到 Week3 Day2 为止，这里仍然只做监听相关和事件循环相关的初始化。
+// 到 Week3 Day3 为止，这里在监听/epoll 初始化之外，还会准备 metrics 输出文件。
 void Server::Initialize() {
     listen_fd_ = net::CreateListenSocket(host_, port_, backlog_);
     MakeListenSocketNonBlocking();
     InitializePoller();
+    InitializeMetricsLogging();
     RegisterListenSocket();
 }
 
@@ -131,11 +173,14 @@ void Server::Run() {
         << ", backlog=" << backlog_
         << ", non-blocking=true"
         << ", epoll=LT"
+        << ", metrics_log=" << metrics_log_path_
         << '\n';
 
     while (!StopRequested()) {
         RunEventLoopOnce();
     }
+
+    MaybeWriteMetricsLog();
 }
 
 // 把监听 fd 切成非阻塞。
@@ -148,6 +193,120 @@ void Server::InitializePoller() {
     poller_.Open();
 }
 
+void Server::InitializeMetricsLogging() {
+    // [Week3 Day3] Begin:
+    // Week3 Day3 先把 metrics 落盘路径固定为 results/webserver/<date>_<machine>/metrics.log。
+    // 这里还不做 Day6 的完整证据目录，只准备当前运行需要的 metrics.log。
+    const std::filesystem::path metrics_dir =
+        std::filesystem::current_path() / "results" / "webserver" / BuildMetricsRunDirectoryName();
+    std::filesystem::create_directories(metrics_dir);
+
+    metrics_log_path_ = (metrics_dir / "metrics.log").string();
+    metrics_log_stream_.open(metrics_log_path_, std::ios::out | std::ios::trunc);
+    if (!metrics_log_stream_.is_open()) {
+        throw std::runtime_error("failed to open metrics log: " + metrics_log_path_);
+    }
+
+    metrics_start_time_ = std::chrono::steady_clock::now();
+    next_metrics_log_time_ = metrics_start_time_ + kMetricsLogInterval;
+    // [Week3 Day3] End
+}
+
+void Server::MaybeWriteMetricsLog() {
+    if (!metrics_log_stream_.is_open()) {
+        return;
+    }
+
+    const auto now_steady = std::chrono::steady_clock::now();
+    if (now_steady < next_metrics_log_time_) {
+        return;
+    }
+
+    const auto now_system = std::chrono::system_clock::now();
+    const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now_system.time_since_epoch());
+    const auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+        now_steady - metrics_start_time_);
+
+    metrics_log_stream_
+        << "ts=" << unix_ms.count()
+        << " uptime_s=" << uptime_s.count()
+        << " rss_kb=" << ReadCurrentRssKb()
+        << " errors_total=" << metrics_errors_total_.load(std::memory_order_relaxed)
+        << " accept_total=" << metrics_accept_total_.load(std::memory_order_relaxed)
+        << " conns_current=" << metrics_conns_current_.load(std::memory_order_relaxed)
+        << " requests_total=" << metrics_requests_total_.load(std::memory_order_relaxed)
+        << " reject_total=" << metrics_reject_total_.load(std::memory_order_relaxed)
+        << " reject_411_total=" << metrics_reject_411_total_.load(std::memory_order_relaxed)
+        << " reject_413_total=" << metrics_reject_413_total_.load(std::memory_order_relaxed)
+        << " reject_429_total=" << metrics_reject_429_total_.load(std::memory_order_relaxed)
+        << " reject_431_total=" << metrics_reject_431_total_.load(std::memory_order_relaxed)
+        << " reject_501_total=" << metrics_reject_501_total_.load(std::memory_order_relaxed)
+        << " reject_503_total=" << metrics_reject_503_total_.load(std::memory_order_relaxed)
+        << " conn_reject_total=" << metrics_conn_reject_total_.load(std::memory_order_relaxed)
+        << " timeout_close_total=" << metrics_timeout_close_total_.load(std::memory_order_relaxed)
+        << " global_inflight_bytes_current="
+        << metrics_global_inflight_bytes_current_.load(std::memory_order_relaxed)
+        << '\n';
+    metrics_log_stream_.flush();
+
+    do {
+        next_metrics_log_time_ += kMetricsLogInterval;
+    } while (next_metrics_log_time_ <= now_steady);
+}
+
+std::uint64_t Server::ReadCurrentRssKb() const {
+    std::ifstream status_file("/proc/self/status");
+    if (!status_file.is_open()) {
+        return 0;
+    }
+
+    std::string line;
+    while (std::getline(status_file, line)) {
+        if (line.rfind("VmRSS:", 0) != 0) {
+            continue;
+        }
+
+        unsigned long long rss_kb = 0;
+        if (std::sscanf(line.c_str(), "VmRSS: %llu kB", &rss_kb) == 1) {
+            return static_cast<std::uint64_t>(rss_kb);
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+void Server::RecordRejectMetric(int status_code) {
+    metrics_reject_total_.fetch_add(1, std::memory_order_relaxed);
+    switch (status_code) {
+    case 411:
+        metrics_reject_411_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case 413:
+        metrics_reject_413_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case 429:
+        metrics_reject_429_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case 431:
+        metrics_reject_431_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case 501:
+        metrics_reject_501_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case 503:
+        metrics_reject_503_total_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        break;
+    }
+}
+
+void Server::RecordErrorMetric() {
+    metrics_errors_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
 // 把监听 fd 注册进 epoll。
 void Server::RegisterListenSocket() {
     poller_.Add(listen_fd_.get(), EPOLLIN);
@@ -157,9 +316,10 @@ void Server::RegisterListenSocket() {
 void Server::RunEventLoopOnce() {
     ProcessReadyQueue();
     ProcessExpiredTimers();
+    MaybeWriteMetricsLog();
 
     // ReadyQueue 和最早一个超时任务会共同决定 epoll_wait 最多能阻塞多久。
-    // 这样没有网络事件时，也能按时处理 header_timeout / idle_keepalive_timeout。
+    // Week3 Day3 起，这里还要兼顾 metrics 的每秒落盘时刻。
     const int wait_timeout_ms = ComputePollTimeoutMs();
     const std::vector<net::PollEvent> events = poller_.Wait(wait_timeout_ms);
 
@@ -168,6 +328,7 @@ void Server::RunEventLoopOnce() {
     }
 
     ProcessExpiredTimers();
+    MaybeWriteMetricsLog();
     FlushPendingCloseQueue();
 }
 
@@ -221,6 +382,8 @@ void Server::ProcessExpiredTimers() {
                                          : "idle_keepalive_timeout"))
             << '\n';
 
+        RecordErrorMetric();
+        metrics_timeout_close_total_.fetch_add(1, std::memory_order_relaxed);
         if (timer.kind == TimerKind::kHeader) {
             CloseClientConnection(timer.fd, "header timeout exceeded before a complete request header arrived");
         } else if (timer.kind == TimerKind::kBody) {
@@ -236,22 +399,41 @@ int Server::ComputePollTimeoutMs() const {
         return 0;
     }
 
+    int wait_timeout_ms = 1000;
     if (timer_heap_.empty()) {
-        return 1000;
+        wait_timeout_ms = 1000;
+    } else {
+        const auto now = std::chrono::steady_clock::now();
+        const auto next_deadline = timer_heap_.top().deadline;
+        if (next_deadline <= now) {
+            return 0;
+        }
+
+        const auto wait =
+            std::chrono::duration_cast<std::chrono::milliseconds>(next_deadline - now);
+        if (wait.count() <= 0) {
+            return 0;
+        }
+
+        wait_timeout_ms = wait.count() > 1000 ? 1000 : static_cast<int>(wait.count());
+    }
+
+    if (next_metrics_log_time_ == std::chrono::steady_clock::time_point {}) {
+        return wait_timeout_ms;
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto next_deadline = timer_heap_.top().deadline;
-    if (next_deadline <= now) {
+    if (next_metrics_log_time_ <= now) {
         return 0;
     }
 
-    const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(next_deadline - now);
-    if (wait.count() <= 0) {
+    const auto metrics_wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(next_metrics_log_time_ - now);
+    if (metrics_wait.count() <= 0) {
         return 0;
     }
 
-    return wait.count() > 1000 ? 1000 : static_cast<int>(wait.count());
+    return std::min(wait_timeout_ms, static_cast<int>(metrics_wait.count()));
 }
 
 // 在本轮 EventLoop 末尾统一释放 pending_close_queue 中保存的连接对象。
@@ -462,6 +644,7 @@ std::size_t Server::DrainAcceptQueue() {
         }
 
         ++accepted_count;
+        metrics_accept_total_.fetch_add(1, std::memory_order_relaxed);
         RegisterAcceptedConnection(std::move(accepted));
     }
 
@@ -492,6 +675,7 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     poller_.Add(client_fd, EPOLLIN | EPOLLRDHUP);
     clients_.emplace(client_fd, std::move(connection));
     ++active_connection_count_;
+    metrics_conns_current_.store(active_connection_count_, std::memory_order_relaxed);
     ArmHeaderTimeout(client_fd, std::chrono::steady_clock::now());
 
     std::cout
@@ -501,7 +685,7 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
         << ", active_connections=" << active_connection_count_
         << '\n';
 
-    // [Week3 Day2] Begin:
+    // [Week3 Day3] Begin:
     // 连接已经纳入 epoll 和 clients_ 之后，立刻检查全局连接数上限。
     // 这里故意放在“注册之后”而不是“注册之前”，是为了严格遵守文档里的计数口径：
     // 1. accept 成功并纳入管理后，活跃连接数先 +1
@@ -512,10 +696,10 @@ void Server::RegisterAcceptedConnection(net::AcceptedSocket accepted) {
     if (!EnforceConnectionLimitAfterRegister(client_fd)) {
         return;
     }
-    // [Week3 Day2] End
+    // [Week3 Day3] End
 }
 
-// [Week3 Day2] New:
+// [Week3 Day3] New:
 // 这个函数专门收口“accept 成功后发现总连接数超限”的分支。
 // 它不直接手写 close 逻辑，而是继续复用唯一关闭入口，原因有两个：
 // 1. 连接计数的递减口径已经写进关闭入口，避免一处忘减导致统计失真
@@ -531,6 +715,9 @@ bool Server::EnforceConnectionLimitAfterRegister(int fd) {
     }
 
     ++conn_reject_total_;
+    metrics_conn_reject_total_.fetch_add(1, std::memory_order_relaxed);
+    metrics_reject_total_.fetch_add(1, std::memory_order_relaxed);
+    RecordErrorMetric();
     std::cout
         << "[Week3 Day2] rejecting client "
         << it->second.peer_endpoint
@@ -585,6 +772,8 @@ bool Server::CheckIpRateLimitBeforeRegister(const net::AcceptedSocket& accepted)
             "Too Many Requests",
             "Too Many Requests\n");
 
+        RecordRejectMetric(429);
+        RecordErrorMetric();
         const bool write_ok = net::WriteBestEffort(accepted.fd.get(), response);
         std::cout
             << "[Week3 Day2] rejected accepted socket from "
@@ -810,10 +999,12 @@ bool Server::ShouldKeepAlive(const http::HttpRequest& request) const {
 void Server::ReleaseInflightBytes(std::size_t release_bytes) noexcept {
     if (release_bytes >= global_inflight_bytes_) {
         global_inflight_bytes_ = 0;
+        metrics_global_inflight_bytes_current_.store(0, std::memory_order_relaxed);
         return;
     }
 
     global_inflight_bytes_ -= release_bytes;
+    metrics_global_inflight_bytes_current_.store(global_inflight_bytes_, std::memory_order_relaxed);
 }
 
 // 带预算检查地向输入缓冲区追加数据。
@@ -835,6 +1026,7 @@ bool Server::AppendToInputBuffer(int fd,
 
     connection->input_buffer.Append(data, size);
     global_inflight_bytes_ += size;
+    metrics_global_inflight_bytes_current_.store(global_inflight_bytes_, std::memory_order_relaxed);
     return true;
 }
 
@@ -853,6 +1045,7 @@ bool Server::AppendToOutputBuffer(int fd, ClientConnection* connection, std::str
 
     connection->output_buffer.append(data);
     global_inflight_bytes_ += data.size();
+    metrics_global_inflight_bytes_current_.store(global_inflight_bytes_, std::memory_order_relaxed);
     return true;
 }
 
@@ -874,6 +1067,7 @@ bool Server::ReplaceOutputBuffer(int fd, ClientConnection* connection, std::stri
 
         connection->output_buffer.assign(data.data(), data.size());
         global_inflight_bytes_ += growth;
+        metrics_global_inflight_bytes_current_.store(global_inflight_bytes_, std::memory_order_relaxed);
         return true;
     }
 
@@ -924,6 +1118,7 @@ bool Server::ConsumePendingRequestBody(int fd, EventBudget* budget) {
     connection.pending_body_bytes_total = 0;
     connection.pending_body_bytes_remaining = 0;
     DisarmBodyTimeout(&connection);
+    metrics_requests_total_.fetch_add(1, std::memory_order_relaxed);
 
     StartOkResponse(fd, finished_request, budget);
     return true;
@@ -1032,6 +1227,7 @@ void Server::ReadFromClient(int fd, EventBudget* budget) {
             continue;
         }
 
+        RecordErrorMetric();
         CloseClientConnection(fd, "read() failed");
         return;
     }
@@ -1138,6 +1334,7 @@ bool Server::ProcessBufferedHeaders(int fd, EventBudget* budget) {
             break;
         }
 
+        metrics_requests_total_.fetch_add(1, std::memory_order_relaxed);
         StartOkResponse(fd, request, budget);
         ++processed_requests;
     }
@@ -1259,6 +1456,7 @@ void Server::StartOkResponse(int fd, const http::HttpRequest& request, EventBudg
         const std::size_t write_attempt = std::min<std::size_t>(response.size(), budget->write_remaining);
         written = net::WriteSomeNonBlocking(fd, std::string_view(response.data(), write_attempt));
     } catch (const std::system_error&) {
+        RecordErrorMetric();
         CloseClientConnection(fd, "write() failed while sending 200 OK");
         return;
     }
@@ -1350,6 +1548,7 @@ void Server::FlushClientOutput(int fd, EventBudget* budget) {
                 fd,
                 std::string_view(connection.output_buffer.data(), write_attempt));
         } catch (const std::system_error&) {
+            RecordErrorMetric();
             CloseClientConnection(fd, "write() failed while flushing outbuf");
             return;
         }
@@ -1404,6 +1603,8 @@ void Server::SendErrorResponseAndClose(int fd,
         reason_phrase,
         std::string(reason_phrase) + "\n");
 
+    RecordRejectMetric(status_code);
+    RecordErrorMetric();
     const bool write_ok = net::WriteBestEffort(fd, response);
     std::cout
         << "[Week3 Day2] sent error response "
@@ -1435,7 +1636,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
         return;
     }
 
-    // [Week3 Day2] New:
+    // [Week3 Day3] New:
     // active_connection_count_ 的递减放在“首次进入关闭流程”的这一刻。
     // 这样做的原因是：
     // 1. 文档要求 closing=true 成为活跃连接计数递减的唯一时机
@@ -1445,6 +1646,7 @@ void Server::CloseClientConnection(int fd, const char* reason) {
     if (active_connection_count_ > 0) {
         --active_connection_count_;
     }
+    metrics_conns_current_.store(active_connection_count_, std::memory_order_relaxed);
 
     it->second.in_ready_queue = false;
     it->second.ready_for_read = false;
